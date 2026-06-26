@@ -1,0 +1,311 @@
+---
+title: "V05 — PROGENy Pathway Analysis & ONC/IMI Classification"
+author: "Abu Saadat"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: "right"
+    toc-title: "Contents"
+    toc-expand: true
+    code-fold: true
+    code-tools: false
+    code-summary: "Hide code"
+    lightbox: true
+    self-contained: true
+    fig-width: 12
+    fig-height: 7
+    fig-dpi: 150
+    cap-location: bottom
+    fontsize: 1.05em
+    linestretch: 1.6
+    theme:
+      light: "cosmo"
+      dark : "cyborg"
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+Pseudobulk PROGENy (7 pathways, 500 top genes) on enhanced sub-spots, following the same
+classification logic as the CUP Xenium pipeline (Script 07, v3_mixed):
+
+- **ONC score** = mean(PI3K, EGFR, MAPK, VEGF) from **Tumour** pseudobulk
+- **IMI score** = mean(JAK-STAT, NFkB, TNFα) from **Stroma** pseudobulk
+- **δ = ONC − IMI**: δ > 0 → ONC; δ ≤ 0 → IMI
+
+Scoring each pathway family in its biologically relevant compartment mirrors the Xenium
+approach and allows direct comparison between CUP and known-primary metastases.
+
+**Input**: `visium_celltypes_sce_list.rds`
+**Output**: `visium_progeny_classification.csv`, pathway heatmap
+
+```{r setup}
+library(SingleCellExperiment)
+library(progeny)
+library(decoupleR)
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(tibble)
+library(tidyr)
+
+BASE <- "."
+OUT_CSV <- file.path(BASE, "visium_progeny_classification.csv")
+
+enhanced_list <- readRDS(file.path(BASE, "visium_celltypes_sce_list.rds"))
+
+PATHWAYS_ONC <- c("PI3K", "EGFR", "MAPK", "VEGF")
+PATHWAYS_IMI <- c("JAK-STAT", "NFkB", "TNFa")
+ALL_PATHWAYS <- c(PATHWAYS_ONC, PATHWAYS_IMI)
+```
+
+## Build pseudobulk expression per sample × compartment
+
+Sum logcounts across all enhanced sub-spots within each compartment (Tumour / Stroma).
+Using logcounts preserves relative expression differences needed by PROGENy.
+
+```{r pseudobulk}
+pseudobulk_list <- lapply(names(enhanced_list), function(s) {
+  sce_enh <- enhanced_list[[s]]
+  lc      <- assay(sce_enh, "logcounts")
+  comp    <- colData(sce_enh)$compartment
+
+  tumour_idx <- which(comp == "Tumour")
+  stroma_idx <- which(comp == "Stroma")
+
+  pb_tumour <- rowSums(lc[, tumour_idx, drop = FALSE])
+  pb_stroma <- rowSums(lc[, stroma_idx, drop = FALSE])
+  pb_total   <- rowSums(lc)
+
+  data.frame(
+    gene           = rownames(sce_enh),
+    tumour_counts  = pb_tumour,
+    stroma_counts  = pb_stroma,
+    total_counts   = pb_total,
+    stringsAsFactors = FALSE
+  )
+})
+names(pseudobulk_list) <- names(enhanced_list)
+
+cat(sprintf("Pseudobulk built for %d samples\n", length(pseudobulk_list)))
+```
+
+## Run PROGENy
+
+PROGENy is run separately on Tumour and Stroma pseudobulks. The model matrix is retrieved
+from `progeny::getModel()` for the 7 selected pathways (500 top genes each).
+
+```{r run-progeny}
+# Build expression matrices: genes × samples
+# Use intersection of genes across all samples (panels differ between datasets)
+all_genes <- Reduce(intersect, lapply(pseudobulk_list, function(x) x$gene))
+cat(sprintf("Common genes across all samples: %d\n", length(all_genes)))
+
+tumour_mat <- sapply(pseudobulk_list, function(x) {
+  vals <- x$tumour_counts; names(vals) <- x$gene; vals[all_genes]
+})
+stroma_mat <- sapply(pseudobulk_list, function(x) {
+  vals <- x$stroma_counts; names(vals) <- x$gene; vals[all_genes]
+})
+rownames(tumour_mat) <- all_genes
+rownames(stroma_mat) <- all_genes
+
+# PROGENy scores (samples × pathways)
+progeny_tumour <- progeny(
+  tumour_mat,
+  scale        = TRUE,
+  organism     = "Human",
+  top          = 500,
+  perm         = 1,
+  z_scores     = TRUE
+) |> as.data.frame()
+
+progeny_stroma <- progeny(
+  stroma_mat,
+  scale        = TRUE,
+  organism     = "Human",
+  top          = 500,
+  perm         = 1,
+  z_scores     = TRUE
+) |> as.data.frame()
+
+# Keep only the 7 selected pathways
+pathways_avail <- intersect(ALL_PATHWAYS, colnames(progeny_tumour))
+if (length(pathways_avail) < length(ALL_PATHWAYS)) {
+  missing <- setdiff(ALL_PATHWAYS, pathways_avail)
+  warning(sprintf("Pathways not found in PROGENy model: %s", paste(missing, collapse=", ")))
+}
+
+progeny_tumour <- progeny_tumour[, intersect(ALL_PATHWAYS, colnames(progeny_tumour)), drop=FALSE]
+progeny_stroma <- progeny_stroma[, intersect(ALL_PATHWAYS, colnames(progeny_stroma)), drop=FALSE]
+
+cat("PROGENy complete.\n")
+cat(sprintf("  Tumour pathways: %s\n", paste(colnames(progeny_tumour), collapse=", ")))
+cat(sprintf("  Stroma pathways: %s\n", paste(colnames(progeny_stroma), collapse=", ")))
+```
+
+## ONC / IMI scoring and classification
+
+```{r classify}
+
+samples <- names(enhanced_list)
+
+# ONC score: mean of oncogenic pathways from Tumour pseudobulk
+onc_pathways_found <- intersect(PATHWAYS_ONC, colnames(progeny_tumour))
+imi_pathways_found <- intersect(PATHWAYS_IMI, colnames(progeny_stroma))
+
+onc_scores <- rowMeans(progeny_tumour[samples, onc_pathways_found, drop = FALSE])
+imi_scores <- rowMeans(progeny_stroma[samples, imi_pathways_found, drop = FALSE])
+delta      <- onc_scores - imi_scores
+phenotype  <- ifelse(delta > 0, "ONC", "IMI")
+
+# Add sample metadata
+sample_meta <- data.frame(
+  sample     = samples,
+  primary    = sapply(enhanced_list, function(x) unique(colData(x)$sample)),
+  stringsAsFactors = FALSE
+)
+
+# Retrieve primary + metastasis from SCE colData if stored; otherwise use sample name
+get_meta <- function(sce, field) {
+  v <- colData(sce)[[field]]
+  if (!is.null(v)) unique(v)[1] else NA_character_
+}
+
+result <- data.frame(
+  sample      = samples,
+  ONC_score   = round(onc_scores, 4),
+  IMI_score   = round(imi_scores, 4),
+  delta       = round(delta, 4),
+  phenotype   = phenotype,
+  stringsAsFactors = FALSE
+)
+rownames(result) <- NULL
+
+print(result)
+```
+
+# Tumor and Stroma Combined Classification
+
+```{r}
+#| echo: false
+#| eval: false
+# Optional: Calculate PROGENy scores on total pseudobulk (Tumour + Stroma) for comparison
+
+total_mat <- sapply(pseudobulk_list, function(x) {
+  vals <- x$total_counts; names(vals) <- x$gene; vals[all_genes]
+})
+rownames(total_mat) <- all_genes
+
+# PROGENy scores (samples × pathways)
+progeny_total_mat <- progeny(
+  total_mat,
+  scale        = TRUE,
+  organism     = "Human",
+  top          = 500,
+  perm         = 1,
+  z_scores     = TRUE
+) |> as.data.frame()
+
+# Keep only the 7 selected pathways
+pathways_avail <- intersect(ALL_PATHWAYS, colnames(progeny_total_mat))
+if (length(pathways_avail) < length(ALL_PATHWAYS)) {
+  missing <- setdiff(ALL_PATHWAYS, pathways_avail)
+  warning(sprintf("Pathways not found in PROGENy model: %s", paste(missing, collapse=", ")))
+}
+
+progeny_total_mat <- progeny_total_mat[, intersect(ALL_PATHWAYS, colnames(progeny_total_mat)), drop=FALSE]
+
+cat("PROGENy complete.\n")
+cat(sprintf("  Total pathways: %s\n", paste(colnames(progeny_total_mat), collapse=", ")))
+
+onc_scores_total <- rowMeans(progeny_total_mat[samples, onc_pathways_found, drop = FALSE])
+imi_scores_total <- rowMeans(progeny_total_mat[samples, imi_pathways_found, drop = FALSE])
+delta_total      <- onc_scores_total - imi_scores_total
+phenotype_total  <- ifelse(delta_total > 0, "ONC", "IMI")
+result$total_ONC_score <- round(onc_scores_total, 4)
+result$total_IMI_score <- round(imi_scores_total, 4)
+result$total_delta     <- round(delta_total, 4)
+result$total_phenotype <- phenotype_total
+
+```
+
+
+
+```{r heatmap, fig.height=7, fig.width=10}
+#| echo: false
+#| eval: false
+## Pathway heatmap
+
+# Combine tumour and stroma scores for heatmap
+# Label each row as "<sample> (T)" or "<sample> (S)"
+tumour_rows <- progeny_tumour[samples, , drop = FALSE]
+stroma_rows <- progeny_stroma[samples, , drop = FALSE]
+
+rownames(tumour_rows) <- paste0(samples, " [T]")
+rownames(stroma_rows) <- paste0(samples, " [S]")
+
+# Column order: ONC pathways first, then IMI
+col_order   <- intersect(c(PATHWAYS_ONC, PATHWAYS_IMI),
+                         union(colnames(tumour_rows), colnames(stroma_rows)))
+heatmap_mat <- rbind(
+  tumour_rows[, intersect(col_order, colnames(tumour_rows)), drop=FALSE],
+  stroma_rows[, intersect(col_order, colnames(stroma_rows)), drop=FALSE]
+)
+
+# Annotation: ONC / IMI pathway group + Tumour / Stroma compartment
+col_annot <- data.frame(
+  pathway_group = ifelse(col_order %in% PATHWAYS_ONC, "ONC", "IMI"),
+  row.names     = col_order
+)
+row_annot <- data.frame(
+  compartment = rep(c("Tumour", "Stroma"), each = length(samples)),
+  phenotype   = rep(result$phenotype, 2),
+  row.names   = rownames(heatmap_mat)
+)
+
+pheatmap(heatmap_mat,
+         annotation_col  = col_annot,
+         annotation_row  = row_annot,
+         cluster_cols    = FALSE,
+         cluster_rows    = TRUE,
+         scale           = "column",
+         color           = colorRampPalette(c("#2166AC","white","#D6604D"))(100),
+         fontsize        = 10,
+         main            = "PROGENy pathway scores — Tumour [T] and Stroma [S] pseudobulks")
+```
+
+## ONC / IMI scatter plot
+
+```{r scatter, fig.height=5, fig.width=7}
+ggplot(result, aes(ONC_score, IMI_score, colour = phenotype, label = sample)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", colour = "grey40") +
+  geom_point(size = 3) +
+  ggrepel::geom_text_repel(size = 3, max.overlaps = 20) +
+  scale_colour_manual(values = c("ONC" = "#E07B54", "IMI" = "#4393C3")) +
+  labs(title = "PROGENy ONC vs IMI scores - Visium metastatic samples",
+       subtitle = "Points above diagonal = IMI; below = ONC",
+       x = "ONC score (mean PI3K, EGFR, MAPK, VEGF - Tumour)",
+       y = "IMI score (mean JAK-STAT, NFkB, TNFa - Stroma)",
+       colour = "Phenotype") +
+  theme_classic(base_size = 12)
+```
+
+## Save results
+
+```{r save}
+write.csv(result, OUT_CSV, row.names = FALSE)
+cat("Saved → ", OUT_CSV, "\n")
+print(table(result$phenotype))
+```
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

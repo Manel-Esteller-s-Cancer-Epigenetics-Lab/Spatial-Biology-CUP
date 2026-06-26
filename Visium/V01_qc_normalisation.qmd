@@ -1,0 +1,259 @@
+---
+title: "V01 — CUP Visium Cohort: QC & Normalisation"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    self-contained: true
+    fig-width: 14
+    fig-height: 8
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+20 CUP Visium samples from Marta's cohort. All analyses are per-sample; no batch correction
+is applied — each downstream script operates on individual samples.
+
+**Output**: `visium_seurat_list.rds` — named list of 20 filtered, SCTransform-normalised Seurat
+objects, one per sample.
+
+```{r setup}
+library(Seurat)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+library(tibble)
+
+options(Seurat.object.assay.version = "v5")
+options(future.globals.maxSize = 4 * 1024^3)
+
+# BASE points to the repository root.
+# Each sample is expected in a sub-directory named by its sample ID,
+# containing the SpaceRanger output (filtered_feature_bc_matrix.h5 + spatial/).
+BASE    <- "."
+OUT_RDS <- file.path(BASE, "results", "01_qc", "visium_seurat_list.rds")
+```
+
+## Sample cohort
+
+```{r metadata}
+sample_meta <- tribble(
+  ~sample,   ~h5_file,
+  "114B",    "filtered_feature_bc_matrix.h5",
+  "271",     "filtered_feature_bc_matrix.h5",
+  "274",     "filtered_feature_bc_matrix.h5",
+  "297",     "filtered_feature_bc_matrix.h5",
+  "351",     "filtered_feature_bc_matrix.h5",
+  "353",     "filtered_feature_bc_matrix.h5",
+  "355",     "filtered_feature_bc_matrix.h5",
+  "368",     "filtered_feature_bc_matrix.h5",
+  "369",     "filtered_feature_bc_matrix.h5",
+  "372",     "filtered_feature_bc_matrix.h5",
+  "373",     "filtered_feature_bc_matrix.h5",
+  "374",     "filtered_feature_bc_matrix.h5",
+  "375",     "filtered_feature_bc_matrix.h5",
+  "376",     "filtered_feature_bc_matrix.h5",
+  "381",     "filtered_feature_bc_matrix.h5",
+  "383",     "filtered_feature_bc_matrix.h5",
+  "385",     "filtered_feature_bc_matrix.h5",
+  "386",     "filtered_feature_bc_matrix.h5",
+  "387",     "filtered_feature_bc_matrix.h5",
+  "394",     "filtered_feature_bc_matrix.h5"
+)
+
+knitr::kable(sample_meta, caption = "CUP Visium cohort — 20 samples")
+```
+
+## Load samples
+
+```{r load-samples, results='asis'}
+# Single cohort — no study grouping needed
+
+load_sample <- function(s, meta) {
+  row  <- meta[meta$sample == s, ]
+  sdir <- file.path(BASE, s)
+  h5   <- row$h5_file
+
+  h5_path <- file.path(sdir, h5)
+  counts  <- Read10X_h5(h5_path)
+  if (is.list(counts)) counts <- counts[["Gene Expression"]]
+  obj <- CreateSeuratObject(counts = counts, assay = "Spatial", project = s)
+  img <- Read10X_Image(image.dir    = file.path(sdir, "spatial"),
+                       image.name   = "tissue_lowres_image.png",
+                       assay        = "Spatial", slice = s,
+                       filter.matrix = TRUE)
+  img <- img[Cells(obj)]
+  DefaultAssay(img) <- "Spatial"
+  obj[[s]] <- img
+
+  obj$sample <- s
+  obj
+}
+
+all_objects <- list()
+for (s in sample_meta$sample) {
+  cat(sprintf("Loading %s ... ", s))
+  obj <- tryCatch(load_sample(s, sample_meta),
+                  error = function(e) { cat(sprintf("ERROR: %s\n", e$message)); NULL })
+  if (!is.null(obj)) {
+    all_objects[[s]] <- obj
+    cat(sprintf("%d spots × %d genes\n", ncol(obj), nrow(obj)))
+  }
+}
+cat(sprintf("\nLoaded %d / %d samples\n", length(all_objects), nrow(sample_meta)))
+```
+
+## QC metrics
+
+```{r qc-metrics}
+all_objects <- lapply(all_objects, function(obj) {
+  obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-", assay = "Spatial")
+  obj
+})
+```
+
+### Summary table
+
+```{r qc-table}
+qc_df <- lapply(names(all_objects), function(s) {
+  md <- all_objects[[s]]@meta.data
+  data.frame(
+    sample       = s,
+    n_spots      = nrow(md),
+    median_UMI   = round(median(md$nCount_Spatial)),
+    median_genes = round(median(md$nFeature_Spatial)),
+    median_mt    = round(median(md$percent.mt), 1)
+  )
+}) |> bind_rows()
+
+knitr::kable(qc_df, caption = "Per-sample QC summary — pre-filter, in-tissue spots only")
+```
+
+### Violin plots
+
+```{r qc-violin, fig.height=10}
+meta_all <- lapply(names(all_objects), function(s) {
+  all_objects[[s]]@meta.data |> mutate(sample_id = s)
+}) |> bind_rows()
+
+p_umi <- ggplot(meta_all, aes(sample_id, nCount_Spatial, fill = sample_id)) +
+  geom_violin(scale = "width", linewidth = 0.3, alpha = 0.85) +
+  geom_boxplot(width = 0.08, outlier.size = 0.3, fill = "white") +
+  scale_y_log10() +
+  labs(title = "UMI per spot", x = NULL, y = "nCount (log10)") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+p_gene <- ggplot(meta_all, aes(sample_id, nFeature_Spatial, fill = sample_id)) +
+  geom_violin(scale = "width", linewidth = 0.3, alpha = 0.85) +
+  geom_boxplot(width = 0.08, outlier.size = 0.3, fill = "white") +
+  labs(title = "Genes per spot", x = NULL, y = "nFeature") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+p_mt <- ggplot(meta_all, aes(sample_id, percent.mt, fill = sample_id)) +
+  geom_violin(scale = "width", linewidth = 0.3, alpha = 0.85) +
+  geom_boxplot(width = 0.08, outlier.size = 0.3, fill = "white") +
+  labs(title = "Mitochondrial %", x = NULL, y = "% MT") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), legend.position = "none")
+
+p_umi / p_gene / p_mt
+```
+
+### Spatial QC maps
+
+```{r qc-spatial, fig.height=5, results='asis'}
+for (s in names(all_objects)) {
+  cat(sprintf("\n#### %s\n\n", s))
+  print(
+    SpatialFeaturePlot(all_objects[[s]],
+                       features       = c("nCount_Spatial", "nFeature_Spatial", "percent.mt"),
+                       ncol           = 3,
+                       pt.size.factor = 1.4,
+                       image.alpha    = 0.35) &
+      theme(legend.position = "right")
+  )
+  cat("\n")
+}
+```
+
+## Filter
+
+Thresholds applied uniformly across all samples. Adjust if any sample has an unusual UMI
+distribution (inspect violin plots above before rendering the report).
+
+```{r filter}
+QC_MIN_UMI   <- 500
+QC_MAX_UMI   <- 50000
+QC_MIN_GENES <- 300
+QC_MAX_MT    <- 20
+
+filtered <- lapply(all_objects, function(obj) {
+  subset(obj,
+    nCount_Spatial   >= QC_MIN_UMI   &
+    nCount_Spatial   <= QC_MAX_UMI   &
+    nFeature_Spatial >= QC_MIN_GENES &
+    percent.mt       <= QC_MAX_MT)
+})
+
+filt_stats <- data.frame(
+  sample   = names(all_objects),
+  before   = sapply(all_objects, ncol),
+  after    = sapply(filtered, ncol)
+) |> mutate(removed = before - after, pct_kept = round(100 * after / before, 1))
+
+knitr::kable(filt_stats, caption = "Spots retained after QC filtering")
+```
+
+## Normalisation — SCTransform per sample
+
+Each sample is normalised independently with SCTransform. The resulting `SCT` assay is used
+for dimensionality reduction; raw counts in `Spatial` assay are preserved for CancerFinder3
+export in V03.
+
+```{r normalise}
+filtered <- parallel::mclapply(filtered, function(obj) {
+  SCTransform(obj, assay = "Spatial", verbose = FALSE)
+}, mc.cores = 14)
+```
+
+## Overview UMAP (QC only — no batch correction)
+
+This merged embedding is for quality inspection only. All downstream analyses are per-sample.
+
+```{r overview-umap, fig.height=6}
+merged <- merge(filtered[[1]], filtered[-1], add.cell.ids = names(filtered))
+DefaultAssay(merged) <- "SCT"
+
+hvg_common <- Reduce(intersect, lapply(filtered, VariableFeatures))
+cat(sprintf("Common HVGs across all samples: %d\n", length(hvg_common)))
+VariableFeatures(merged) <- hvg_common
+
+merged <- RunPCA(merged, npcs = 30, verbose = FALSE)
+merged <- RunUMAP(merged, dims = 1:20, verbose = FALSE)
+
+p_sample <- DimPlot(merged, group.by = "sample", pt.size = 0.3) + ggtitle("Sample")
+
+p_sample
+```
+
+## Save checkpoint
+
+```{r save}
+saveRDS(filtered, OUT_RDS)
+cat(sprintf("Saved %d samples → %s\n", length(filtered), OUT_RDS))
+lapply(names(filtered), function(s) {
+  cat(sprintf("  %s: %d spots\n", s, ncol(filtered[[s]]))  )
+})
+```
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

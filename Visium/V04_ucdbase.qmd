@@ -1,0 +1,484 @@
+---
+title: "V04b — UCD_Base Immune Deconvolution (Coarse Annotation)"
+author: "Abu Saadat"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: "right"
+    toc-title: "Contents"
+    toc-expand: true
+    code-fold: true
+    code-tools: false
+    code-summary: "Hide code"
+    lightbox: true
+    self-contained: true
+    fig-width: 14
+    fig-height: 7
+    fig-dpi: 150
+    cap-location: bottom
+    fontsize: 1.05em
+    linestretch: 1.6
+    theme:
+      light: "cosmo"
+      dark : "cyborg"
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+UCD_Base (UniCell Deconvolve) is a pre-trained deep learning model for context-free
+cell type deconvolution, trained on >28 million single cells across 840+ cell types
+(Charytonowicz et al., *Nature Communications* 2023). Unlike cell2location, it does
+**not** require a matched single-cell reference — the model is pre-trained and accessed
+via a cloud API.
+
+**Strategy**: UCD_Base is run on CF3-annotated **Stroma** sub-spots only (from V03).
+Each stromal sub-spot receives fractional cell type predictions. The dominant (argmax)
+immune type is assigned as the sub-spot label; Tumour sub-spots retain their CF3 label.
+
+This provides a **coarse annotation** complementary to the cell2location fine-grained
+deconvolution in V04.
+
+**Input**: `visium_annotated_sce_list.rds` (V03)
+**Output**: `visium_celltypes_ucd_sce_list.rds`, `ucd_results/<sample>_fractions.csv`
+
+```{r setup}
+library(SingleCellExperiment)
+library(Matrix)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+BASE       <- "."
+UCD_DIR    <- file.path(BASE, "ucd_results")
+EXPORT_DIR <- file.path(UCD_DIR, "spatial_inputs")
+OUT_RDS    <- file.path(BASE, "visium_celltypes_ucd_sce_list.rds")
+
+for (d in c(UCD_DIR, EXPORT_DIR))
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+enhanced_list <- readRDS(file.path(BASE, "visium_annotated_sce_list.rds"))
+
+# ── UCD API token ────────────────────────────────────────────────────────────
+# Set your UCD_Base API token here or via the environment variable UCD_TOKEN.
+# Request a token at https://celldeconvolve.com
+UCD_TOKEN <- Sys.getenv("UCD_TOKEN", "your-ucd-token-here")
+
+# Coarse immune groups for downstream labelling
+# UCD_Base returns ~840 cell types; we map them to broad immune categories
+IMMUNE_MAP <- list(
+  "T_cells"    = c("t cell", "cd4", "cd8", "treg", "regulatory t",
+                    "memory t", "naive t", "th1", "th2", "th17",
+                    "gamma delta", "nkt", "cytotoxic t"),
+  "B_cells"    = c("b cell", "plasma cell", "plasmablast"),
+  "Monocytes"  = c("monocyte", "macrophage", "kupffer", "microglia"),
+  "NK_cells"   = c("nk cell", "natural killer"),
+  "Dendritic"  = c("dendritic", "langerhans"),
+  "Neutrophil" = c("neutrophil", "granulocyte"),
+  "Mast"       = c("mast cell", "basophil")
+)
+
+CT_COLOURS <- c(
+  "Tumour"     = "#C0392B",
+  "T_cells"    = "#59A14F",
+  "B_cells"    = "#4E79A7",
+  "Monocytes"  = "#F28E2B",
+  "NK_cells"   = "#6c4c8d",
+  "Dendritic"  = "#76B7B2",
+  "Neutrophil" = "#E15759",
+  "Mast"       = "#BAB0AC",
+  "Other"      = "#95A5A6"
+)
+```
+
+## Step 1 — Export Stroma sub-spots per sample
+
+Only CF3 Stroma sub-spots are exported for UCD_Base deconvolution.
+Expression is converted from logcounts → pseudo-counts via `expm1()`.
+
+```{r export-stroma}
+for (s in names(enhanced_list)) {
+  exp_dir   <- file.path(EXPORT_DIR, s)
+  done_flag <- file.path(exp_dir, "export_done.flag")
+  dir.create(exp_dir, showWarnings = FALSE)
+
+  if (file.exists(done_flag)) next
+
+  sce_enh <- enhanced_list[[s]]
+  cd      <- as.data.frame(colData(sce_enh))
+
+  # Select only Stroma sub-spots
+  stroma_idx <- which(cd$compartment == "Stroma")
+
+  if (length(stroma_idx) == 0) {
+    cat(sprintf("[%s] No stroma sub-spots — skipping export\n", s))
+    next
+  }
+
+  sce_stroma <- sce_enh[, stroma_idx]
+
+  # Convert logcounts → pseudo-counts (genes × sub-spots)
+  lc <- assay(sce_stroma, "logcounts")
+  pc <- Matrix::Matrix(expm1(as.matrix(lc)), sparse = TRUE)
+
+  Matrix::writeMM(pc, file.path(exp_dir, "counts.mtx"))   # genes × sub-spots
+  writeLines(rownames(sce_stroma), file.path(exp_dir, "genes.txt"))
+  writeLines(colnames(sce_stroma), file.path(exp_dir, "barcodes.txt"))
+
+  # Metadata
+  meta_df <- data.frame(
+    barcode     = colnames(sce_stroma),
+    compartment = cd$compartment[stroma_idx],
+    array_row   = cd$array_row[stroma_idx],
+    array_col   = cd$array_col[stroma_idx]
+  )
+  write.csv(meta_df, file.path(exp_dir, "metadata.csv"), row.names = FALSE)
+  file.create(done_flag)
+}
+cat(sprintf("Stroma sub-spots exported for %d samples\n", length(enhanced_list)))
+```
+
+## Step 2 — Write UCD_Base Python runner
+
+```{r write-ucd-script}
+ucd_py <- file.path(UCD_DIR, "run_ucdbase.py")
+writeLines(c(
+  "import sys, os, warnings",
+  "warnings.filterwarnings('ignore')",
+  "import numpy as np, pandas as pd",
+  "import scipy.io, anndata as ad, scanpy as sc",
+  "import ucdeconvolve as ucd",
+  "",
+  "input_dir, output_csv, token = sys.argv[1:4]",
+  "sample_name = os.path.basename(input_dir)",
+  "",
+  "# ── Load spatial counts ─────────────────────────────────────────────────",
+  "mat      = scipy.io.mmread(os.path.join(input_dir, 'counts.mtx')).T.tocsr()  # spots × genes",
+  "genes    = open(os.path.join(input_dir, 'genes.txt')).read().splitlines()",
+  "barcodes = open(os.path.join(input_dir, 'barcodes.txt')).read().splitlines()",
+  "",
+  "adata = ad.AnnData(",
+  "    X   = mat,",
+  "    obs = pd.DataFrame(index=barcodes),",
+  "    var = pd.DataFrame(index=genes),",
+  ")",
+  "",
+  "# Store raw counts before any processing (UCD expects raw counts in .raw)",
+  "adata.raw = adata.copy()",
+  "",
+  "# Basic preprocessing: normalize + log1p (standard scanpy pipeline)",
+  "sc.pp.normalize_total(adata, target_sum=1e4)",
+  "sc.pp.log1p(adata)",
+  "",
+  "print(f'  Spatial: {adata.shape} ({sample_name})')",
+  "",
+  "# ── Authenticate and run UCD_Base ─────────────────────────────────────",
+  "ucd.api.authenticate(token)",
+  "",
+  "# Run base deconvolution with split=True for primary/cancer/cell_line separation",
+  "ucd.tl.base(",
+  "    adata,",
+  "    split     = True,",
+  "    sort      = True,",
+  "    propagate = True,",
+  "    use_raw   = True,",
+  ")",
+  "",
+  "# ── Extract primary cell type fractions ────────────────────────────────",
+  "# UCD stores results in adata.obsm['ucdbase_primary'] (ndarray)",
+  "# Cell type names are in adata.uns['ucdbase']['headers']['primary']",
+  "headers = adata.uns['ucdbase']['headers']",
+  "if 'ucdbase_primary' in adata.obsm and 'primary' in headers:",
+  "    col_names = list(headers['primary'])",
+  "    frac_df = pd.DataFrame(",
+  "        adata.obsm['ucdbase_primary'],",
+  "        index   = adata.obs_names,",
+  "        columns = col_names,",
+  "    )",
+  "elif 'ucdbase_raw' in adata.obsm and 'raw' in headers:",
+  "    col_names = list(headers['raw'])",
+  "    frac_df = pd.DataFrame(",
+  "        adata.obsm['ucdbase_raw'],",
+  "        index   = adata.obs_names,",
+  "        columns = col_names,",
+  "    )",
+  "else:",
+  "    raise RuntimeError(f'No UCD results found. obsm={list(adata.obsm.keys())}, headers={list(headers.keys())}')",
+  "",
+  "print(f'  Cell types: {len(frac_df.columns)} | first 10: {list(frac_df.columns[:10])}')",
+  "",
+  "# Add dominant cell type",
+  "frac_df['dominant_type'] = frac_df.idxmax(axis=1)",
+  "frac_df['max_fraction']  = frac_df.max(axis=1, numeric_only=True)",
+  "frac_df['barcode']       = frac_df.index",
+  "",
+  "os.makedirs(os.path.dirname(output_csv), exist_ok=True)",
+  "frac_df.to_csv(output_csv, index=False)",
+  "print(f'  Saved: {output_csv} ({len(frac_df)} spots, {frac_df.shape[1]-3} cell types)')",
+  "",
+  "# Also save the full anndata for inspection",
+  "adata.write_h5ad(os.path.join(os.path.dirname(output_csv), f'{sample_name}_ucd.h5ad'))",
+  "print(f'  Saved h5ad for inspection')"
+), ucd_py)
+```
+
+## Step 3 — Run UCD_Base per sample
+
+```{r run-ucd, results='asis'}
+ucd_failed <- character(0)
+
+for (s in names(enhanced_list)) {
+  out_csv   <- file.path(UCD_DIR, paste0(s, "_fractions.csv"))
+  done_flag <- file.path(UCD_DIR, paste0(s, "_ucd_done.flag"))
+
+  if (file.exists(done_flag)) {
+    cat(sprintf("**%s**: already done — skipping\n\n", s)); next
+  }
+
+  # Check stroma export exists
+  exp_dir <- file.path(EXPORT_DIR, s)
+  if (!file.exists(file.path(exp_dir, "export_done.flag"))) {
+    cat(sprintf("**%s**: no stroma export — skipping\n\n", s))
+    ucd_failed <- c(ucd_failed, s)
+    next
+  }
+
+  cat(sprintf("\n---\n\n### %s\n\n", s))
+
+  cmd <- sprintf("conda run -n ucdenv python %s %s %s %s",
+                  shQuote(ucd_py),
+                  shQuote(exp_dir),
+                  shQuote(out_csv),
+                  shQuote(UCD_TOKEN))
+  exit_code <- system(cmd)
+
+  if (exit_code != 0) {
+    warning(sprintf("UCD_Base failed for %s — skipping", s))
+    cat(sprintf("  **SKIPPED** (UCD_Base failed)\n\n"))
+    ucd_failed <- c(ucd_failed, s)
+    next
+  }
+  file.create(done_flag)
+  cat(sprintf("  UCD_Base complete → %s\n\n", out_csv))
+}
+
+if (length(ucd_failed) > 0)
+  cat(sprintf("\n> **%d sample(s) skipped**: %s\n\n",
+              length(ucd_failed), paste(ucd_failed, collapse = ", ")))
+```
+
+## Import UCD results and assign coarse immune labels
+
+Map the fine-grained UCD cell types to coarse immune categories.
+
+```{r import-ucd, results='asis'}
+ucd_annotations <- list()
+
+for (s in names(enhanced_list)) {
+  out_csv <- file.path(UCD_DIR, paste0(s, "_fractions.csv"))
+  if (!file.exists(out_csv)) next
+
+  df <- read.csv(out_csv, stringsAsFactors = FALSE)
+  rownames(df) <- df$barcode
+
+  # UCD outputs 700+ hierarchical cell types. "cell" or "somatic cell" will
+  # always have the highest fraction due to propagation.
+  # We compute the score for each coarse immune group by taking the max
+  # fraction among all cell type columns matching that group's patterns.
+  clean_cols <- tolower(gsub(".", " ", colnames(df), fixed = TRUE))
+  scores <- matrix(0, nrow = nrow(df), ncol = length(IMMUNE_MAP))
+  colnames(scores) <- names(IMMUNE_MAP)
+
+  for (group in names(IMMUNE_MAP)) {
+    match_cols <- c()
+    for (p in IMMUNE_MAP[[group]]) {
+      idx <- grep(p, clean_cols, fixed = TRUE)
+      match_cols <- unique(c(match_cols, colnames(df)[idx]))
+    }
+    if (length(match_cols) > 0) {
+      scores[, group] <- apply(df[, match_cols, drop = FALSE], 1, max, na.rm = TRUE)
+    }
+  }
+
+  max_immune <- apply(scores, 1, max, na.rm = TRUE)
+  dominant_group <- colnames(scores)[apply(scores, 1, which.max)]
+
+  # If the highest immune cell signature is very low (< 5%), it's a non-immune stroma cell
+  dominant_group[max_immune < 0.05] <- "Other"
+
+  df$coarse_type <- dominant_group
+  ucd_annotations[[s]] <- df
+
+  n_spots <- nrow(df)
+  top_types <- names(sort(table(df$coarse_type), decreasing = TRUE))[1:3]
+  cat(sprintf("**%s**: %d stroma spots | top coarse types: %s\n\n",
+              s, n_spots, paste(top_types, collapse = ", ")))
+}
+
+# Assign celltype to SCE objects:
+# Tumour sub-spots (CF3): keep "Tumour" label
+# Stroma sub-spots: label with coarse immune type from UCD_Base
+enhanced_list <- setNames(lapply(names(enhanced_list), function(s) {
+  sce <- enhanced_list[[s]]
+  ann <- ucd_annotations[[s]]
+
+  if (is.null(ann)) {
+    colData(sce)$celltype       <- colData(sce)$compartment
+    colData(sce)$ucd_dominant   <- NA_character_
+    colData(sce)$ucd_coarse     <- NA_character_
+    return(sce)
+  }
+
+  idx <- match(colnames(sce), ann$barcode)
+
+  # Store UCD annotations
+  colData(sce)$ucd_dominant <- ann$dominant_type[idx]
+  colData(sce)$ucd_coarse   <- ann$coarse_type[idx]
+
+  # Final celltype: CF3 Tumour wins; stroma gets UCD coarse immune type
+  colData(sce)$celltype <- ifelse(
+    colData(sce)$compartment == "Tumour",
+    "Tumour",
+    ann$coarse_type[idx]
+  )
+  # Replace NA celltypes with compartment label
+  na_mask <- is.na(colData(sce)$celltype)
+  colData(sce)$celltype[na_mask] <- colData(sce)$compartment[na_mask]
+  sce
+}), names(enhanced_list))
+```
+
+## Stroma sub-spot coarse immune composition
+
+```{r stroma-composition, fig.height=5}
+comp_df <- lapply(names(enhanced_list), function(s) {
+  ann <- ucd_annotations[[s]]
+  if (is.null(ann)) return(NULL)
+  data.frame(sample = s, coarse_type = ann$coarse_type,
+             stringsAsFactors = FALSE)
+}) |> bind_rows()
+
+if (nrow(comp_df) > 0) {
+  comp_summary <- comp_df |>
+    count(sample, coarse_type) |>
+    group_by(sample) |>
+    mutate(pct = 100 * n / sum(n)) |>
+    ungroup()
+
+  ggplot(comp_summary, aes(x = sample, y = pct, fill = coarse_type)) +
+    geom_col(width = 0.75) +
+    scale_fill_manual(values = CT_COLOURS, na.value = "#95A5A6") +
+    labs(title = "UCD_Base coarse immune composition — CF3 Stroma sub-spots",
+         x = NULL, y = "% of stroma sub-spots", fill = "Cell type") +
+    theme_classic(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "right")
+}
+```
+
+## Overall TME Composition
+
+```{r tme-composition-by-celltype, fig.height=5}
+if (nrow(comp_df) > 0) {
+  p_tme <- ggplot(comp_summary, aes(x = reorder(coarse_type, -pct, FUN = median), y = pct, fill = coarse_type)) +
+    geom_boxplot(alpha = 0.8, outlier.shape = NA) +
+    geom_jitter(width = 0.2, alpha = 0.6, size = 1.5) +
+    scale_fill_manual(values = CT_COLOURS, na.value = "#95A5A6") +
+    labs(title = "TME Immune Composition across Samples",
+         x = "Coarse Immune Type", y = "% of Stroma Sub-spots per sample") +
+    theme_classic(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "none")
+  print(p_tme)
+
+  # Export the data used for the boxplot to a CSV
+  write.csv(comp_summary, file.path(UCD_DIR, "TME_composition_summary.csv"), row.names = FALSE)
+}
+```
+
+## Spatial cell type maps
+
+```{r spatial-maps, fig.height=4.5, results='asis'}
+for (s in names(enhanced_list)) {
+  if (is.null(ucd_annotations[[s]])) next
+  cat(sprintf("\n#### %s\n\n", s))
+  sce <- enhanced_list[[s]]
+
+  df <- data.frame(
+    col      = colData(sce)$array_col,
+    row      = colData(sce)$array_row,
+    celltype = colData(sce)$celltype
+  )
+
+  p <- ggplot(df, aes(col, -row, colour = celltype)) +
+    geom_point(size = 0.35, alpha = 0.8) +
+    coord_fixed() +
+    scale_colour_manual(values = CT_COLOURS, na.value = "#95A5A6") +
+    labs(title = s, colour = NULL) +
+    theme_classic(base_size = 11) +
+    theme(
+      panel.background  = element_rect(fill = "black"),
+      plot.background   = element_rect(fill = "black"),
+      axis.line         = element_line(colour = "white"),
+      axis.text         = element_text(colour = "white"),
+      axis.title        = element_text(colour = "white"),
+      plot.title        = element_text(colour = "white"),
+      legend.background = element_rect(fill = "black"),
+      legend.text       = element_text(colour = "white"),
+      legend.key        = element_rect(fill = "black")
+    ) +
+    guides(colour = guide_legend(override.aes = list(size = 2.5)))
+
+  print(p)
+  cat("\n")
+}
+```
+
+## Summary table
+
+```{r summary-table}
+summary_df <- lapply(names(enhanced_list), function(s) {
+  ct  <- colData(enhanced_list[[s]])$celltype
+  com <- colData(enhanced_list[[s]])$compartment
+  n   <- length(ct)
+  data.frame(
+    sample       = s,
+    n_subspots   = n,
+    pct_tumour   = round(100 * mean(com == "Tumour", na.rm = TRUE), 1),
+    pct_t_cells  = round(100 * mean(ct == "T_cells",   na.rm = TRUE), 1),
+    pct_mono     = round(100 * mean(ct == "Monocytes",  na.rm = TRUE), 1),
+    pct_nk       = round(100 * mean(ct == "NK_cells",   na.rm = TRUE), 1),
+    pct_b        = round(100 * mean(ct == "B_cells",    na.rm = TRUE), 1),
+    pct_dc       = round(100 * mean(ct == "Dendritic",  na.rm = TRUE), 1),
+    pct_other    = round(100 * mean(ct == "Other",      na.rm = TRUE), 1)
+  )
+}) |> bind_rows()
+
+knitr::kable(summary_df,
+             col.names = c("Sample", "Sub-spots", "% Tumour",
+                           "% T cells", "% Mono/Mac", "% NK", "% B",
+                           "% DC", "% Other"),
+             caption = "Coarse cell type composition per sample (UCD_Base, enhanced sub-spots)")
+```
+
+## Save checkpoint
+
+```{r save}
+if (length(ucd_failed) > 0) {
+  cat(sprintf("Excluding %d failed sample(s): %s\n",
+              length(ucd_failed), paste(ucd_failed, collapse = ", ")))
+  enhanced_list <- enhanced_list[setdiff(names(enhanced_list), ucd_failed)]
+}
+saveRDS(enhanced_list, OUT_RDS)
+cat(sprintf("Saved %d annotated SCEs → %s\n", length(enhanced_list), OUT_RDS))
+```
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

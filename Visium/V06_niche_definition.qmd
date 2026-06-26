@@ -1,0 +1,833 @@
+---
+title: "V06 — Tumour Niche Definition"
+author: "Abu Saadat"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: "right"
+    toc-title: "Contents"
+    toc-expand: true
+    code-fold: true
+    code-tools: false
+    code-summary: "Hide code"
+    lightbox: true
+    self-contained: true
+    fig-width: 12
+    fig-height: 7
+    fig-dpi: 150
+    cap-location: bottom
+    fontsize: 1.05em
+    linestretch: 1.6
+    theme:
+      light: "cosmo"
+      dark : "cyborg"
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+Classifies each enhanced sub-spot into a spatial niche zone based on physical distance to
+the nearest Tumour sub-spot:
+
+| Zone | Threshold |
+|------|-----------|
+| **Tumour** | sub-spot is Tumour (compartment == "Tumour") |
+| **Peritumoral** | non-Tumour, distance < 100 µm |
+| **Distal** | distance ≥ 100 µm |
+
+Note: the Xenium pipeline uses a finer "Tumour niche" zone (< 30 µm) that is not applicable
+here — BayesSpace sub-spots with `nsubspots.per.edge = 3` have a minimum inter-sub-spot
+spacing of ~33 µm (100 µm original pitch ÷ 3), so the 30 µm zone is sub-resolution for Visium
+and has been merged into Peritumoral.
+
+**Distance calculation**: pixel coordinates (`pxl_col_in_fullres`, `pxl_row_in_fullres`) from
+the Visium spatial directory are converted to µm using a per-sample calibration factor:
+`microns_per_pixel = 55 / spot_diameter_fullres`, where `spot_diameter_fullres` (spot diameter
+in full-resolution image pixels) is read from each sample's `scalefactors_json.json`.
+Array coordinates are **not** used: the Visium hex grid has `array_col` incrementing by 2
+between same-row neighbours and uses non-isotropic row/column scales, making array-unit
+distances incorrect. Pixel coordinates are isotropic and give true Euclidean distances.
+Distances are computed with `RANN::nn2()`.
+
+**Input**: `visium_annotated_sce_list.rds`
+**Output**: `visium_niches_sce_list.rds`
+
+```{r setup}
+library(SingleCellExperiment)
+library(RANN)
+library(jsonlite)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(patchwork)
+
+BASE    <- "."
+OUT_RDS <- file.path(BASE, "visium_niches_ucd_sce_list.rds")
+
+# Niche distance threshold (µm)
+# "Tumour niche" (< 30 µm) collapsed into Peritumoral: BayesSpace sub-spot spacing
+# (~33 µm with nsubspots.per.edge=3) is coarser than the 30 µm Xenium threshold.
+NICHE_OUTER      <- 100   # Peritumoral: < 100 µm; Distal: ≥ 100 µm
+
+# Known Visium spot diameter (capture area) = 55 µm
+# Used with spot_diameter_fullres (pixels) from scalefactors_json.json
+# to derive a per-sample microns-per-pixel conversion factor.
+SPOT_DIAMETER_UM <- 55
+
+enhanced_list <- readRDS(file.path(BASE, "visium_celltypes_ucd_sce_list.rds"))
+# sample_dirs derived dynamically — only scalefactors_json.json is needed
+sample_dirs <- setNames(file.path(BASE, names(enhanced_list)), names(enhanced_list))
+```
+
+## Assign niche zones per sample
+
+```{r assign-niches, results='asis'}
+for (s in names(enhanced_list)) {
+  cat(sprintf("\n---\n\n### %s\n\n", s))
+  sce_enh <- enhanced_list[[s]]
+
+  cd         <- as.data.frame(colData(sce_enh))
+  is_tumour  <- cd$compartment == "Tumour"
+  n_tumour   <- sum(is_tumour, na.rm = TRUE)
+  n_nontumour <- sum(!is_tumour, na.rm = TRUE)
+
+  cat(sprintf("  %d tumour sub-spots, %d non-tumour sub-spots\n\n",
+              n_tumour, n_nontumour))
+
+  if (n_tumour == 0) {
+    warning(sprintf("%s: no Tumour sub-spots — all sub-spots set to Distal", s))
+    colData(sce_enh)$niche <- "Distal"
+    enhanced_list[[s]] <- sce_enh
+    next
+  }
+
+  # Convert pixel coordinates to physical µm via per-sample calibration
+  sf_path <- file.path(sample_dirs[s], "spatial", "scalefactors_json.json")
+  sf      <- jsonlite::fromJSON(sf_path)
+  mpp     <- SPOT_DIAMETER_UM / sf$spot_diameter_fullres   # microns per pixel
+  cat(sprintf("  spot_diameter_fullres = %.2f px → %.4f µm/px\n\n",
+              sf$spot_diameter_fullres, mpp))
+
+  # Use parent coordinates stored in colData by V02 (from Seurat image @coordinates).
+  # parent_array_row/col and pxl_row/col_in_fullres identify the physical parent spot;
+  # scale is derived by linear regression across all parent spots in this sample.
+  parent_df    <- unique(data.frame(
+    array_row = cd$parent_array_row,
+    array_col = cd$parent_array_col,
+    pxl_row   = cd$pxl_row_in_fullres,
+    pxl_col   = cd$pxl_col_in_fullres
+  ))
+  scale_col_px <- coef(lm(pxl_col ~ array_col, data = parent_df))[["array_col"]]
+  scale_row_px <- coef(lm(pxl_row ~ array_row, data = parent_df))[["array_row"]]
+  cat(sprintf("  scale: %.1f px/col-unit (%.1f µm), %.1f px/row-unit (%.1f µm)\n\n",
+              scale_col_px, scale_col_px * mpp,
+              scale_row_px, scale_row_px * mpp))
+
+  parent_pxl_col <- cd$pxl_col_in_fullres
+  parent_pxl_row <- cd$pxl_row_in_fullres
+  parent_arr_col <- cd$parent_array_col
+  parent_arr_row <- cd$parent_array_row
+
+  # Inferred sub-spot pixel position = physical parent centre + array offset × scale
+  coords_um <- data.frame(
+    x = (parent_pxl_col + (cd$array_col - parent_arr_col) * scale_col_px) * mpp,
+    y = (parent_pxl_row + (cd$array_row - parent_arr_row) * scale_row_px) * mpp
+  )
+
+  # Valid masks — drop sub-spots with NA pixel coords (off-by-one in V02 spot.idx;
+  # affects ~1 parent spot per sample; those are assigned Distal)
+  valid          <- complete.cases(coords_um)
+  is_tumour_v    <- is_tumour  & valid
+  is_nontumour_v <- !is_tumour & valid
+
+  if (any(!valid))
+    cat(sprintf("  Dropping %d sub-spots with NA pixel coords → Distal\n\n", sum(!valid)))
+
+  tumour_coords    <- coords_um[is_tumour_v,    , drop = FALSE]
+  nontumour_coords <- coords_um[is_nontumour_v, , drop = FALSE]
+
+  # Nearest tumour sub-spot for each valid non-tumour sub-spot
+  nn_result      <- RANN::nn2(data = tumour_coords, query = nontumour_coords, k = 1)
+  dist_to_tumour <- nn_result$nn.dists[, 1]  # µm
+
+  # Classify valid non-tumour sub-spots
+  niche_nontumour_v <- dplyr::case_when(
+    dist_to_tumour <  NICHE_OUTER ~ "Peritumoral",
+    TRUE                          ~ "Distal"
+  )
+
+  # Combine: valid Tumour | valid non-tumour classified | NA-coord → Distal
+  niche_all <- character(nrow(cd))
+  niche_all[is_tumour_v]    <- "Tumour"
+  niche_all[is_nontumour_v] <- niche_nontumour_v
+  niche_all[!valid]         <- "Distal"
+
+  colData(sce_enh)$niche          <- niche_all
+  colData(sce_enh)$dist_to_tumour <- NA_real_
+  colData(sce_enh)$dist_to_tumour[is_nontumour_v] <- dist_to_tumour
+
+  enhanced_list[[s]] <- sce_enh
+
+  # Report
+  niche_fac    <- factor(niche_all, levels = c("Tumour", "Peritumoral", "Distal"))
+  niche_counts <- table(niche_fac)
+  niche_pct    <- round(100 * niche_counts / sum(niche_counts), 1)
+  for (zone in c("Tumour", "Peritumoral", "Distal")) {
+    cat(sprintf("  %-20s %5d sub-spots (%s%%)\n",
+                zone,
+                niche_counts[zone],
+                niche_pct[zone]))
+  }
+  cat("\n")
+}
+```
+
+## Spatial niche maps
+
+```{r niche-maps, fig.height=4.5, results='asis'}
+niche_colours <- c(
+  "Tumour"      = "#C0392B",
+  "Peritumoral" = "#E67E22",
+  "Distal"      = "#BDC3C7"
+)
+niche_levels <- c("Tumour", "Peritumoral", "Distal")
+
+for (s in names(enhanced_list)) {
+  cat(sprintf("\n#### %s\n\n", s))
+  sce_enh <- enhanced_list[[s]]
+
+  df <- data.frame(
+    col   = colData(sce_enh)$array_col,
+    row   = colData(sce_enh)$array_row,
+    niche = factor(colData(sce_enh)$niche, levels = niche_levels)
+  )
+
+  p <- ggplot(df, aes(col, -row, colour = niche)) +
+    geom_point(size = 0.25, alpha = 0.8) +
+    coord_fixed() +
+    scale_colour_manual(values = niche_colours, drop = FALSE) +
+    labs(title = s, colour = NULL) +
+    theme_classic(base_size = 11) +
+    theme(
+      panel.background = element_rect(fill = "black"),
+      plot.background  = element_rect(fill = "black"),
+      axis.line        = element_line(colour = "white"),
+      axis.text        = element_text(colour = "white"),
+      axis.title       = element_text(colour = "white"),
+      plot.title       = element_text(colour = "white"),
+      legend.background = element_rect(fill = "black"),
+      legend.text      = element_text(colour = "white"),
+      legend.key       = element_rect(fill = "black")
+    ) +
+    guides(colour = guide_legend(override.aes = list(size = 2.5)))
+
+  print(p)
+  cat("\n")
+}
+
+# grid all plots together
+# (note: this is a bit hacky since the individual plots are printed in a loop, but it works)
+ plot_list <- lapply(names(enhanced_list), function(s) {
+   sce_enh <- enhanced_list[[s]]
+   df <- data.frame(
+     col   = colData(sce_enh)$array_col,
+     row   = colData(sce_enh)$array_row,
+     niche = factor(colData(sce_enh)$niche, levels = niche_levels)
+   )
+   ggplot(df, aes(col, -row, colour = niche)) +
+     geom_point(size = 0.25, alpha = 0.8) +
+     coord_fixed() +
+     scale_colour_manual(values = niche_colours, drop = FALSE) +
+     labs(title = s, colour = NULL) +
+     theme_classic(base_size = 11) +
+     theme(
+       panel.background = element_rect(fill = "black"),
+       plot.background  = element_rect(fill = "black"),
+       axis.line        = element_line(colour = "white"),
+       axis.text        = element_text(colour = "white"),
+       axis.title       = element_text(colour = "white"),
+       plot.title       = element_text(colour = "white"),
+       legend.background = element_rect(fill = "black"),
+       legend.text      = element_text(colour = "white"),
+       legend.key       = element_rect(fill = "black")
+     ) +
+     guides(colour = guide_legend(override.aes = list(size = 2.5)))
+ })
+ combined_plot <- wrap_plots(plot_list, ncol = 4) +
+   plot_annotation(title = "Spatial niche maps", theme = theme(plot.title = element_text(size = 16, face = "bold")))
+ print(combined_plot)
+
+# Save the combined plot as a high-resolution image
+ ggsave(filename = file.path(BASE, "spatial_niche_maps.png"), plot = combined_plot, width = 16, height = 12, dpi = 300)
+
+```
+
+## Distance distribution plots
+
+```{r dist-plots, fig.height=4}
+dist_df <- lapply(names(enhanced_list), function(s) {
+  cd <- as.data.frame(colData(enhanced_list[[s]]))
+  cd_nontumour <- cd[cd$compartment == "Stroma" & !is.na(cd$dist_to_tumour), ]
+  data.frame(sample = s, dist_um = cd_nontumour$dist_to_tumour)
+}) |> bind_rows()
+
+ggplot(dist_df, aes(dist_um, colour = sample)) +
+  geom_density(linewidth = 0.7) +
+  geom_vline(xintercept = NICHE_OUTER,
+             linetype = "dashed", colour = "grey40") +
+  annotate("text", x = NICHE_OUTER, y = Inf, label = "100 µm",
+           hjust = -0.1, vjust = 1.5, size = 3) +
+  scale_x_log10() +
+  labs(title = "Distance of Stroma sub-spots to nearest Tumour sub-spot",
+       x = "Distance to nearest tumour sub-spot (µm, log scale)",
+       y = "Density", colour = "Sample") +
+  theme_classic(base_size = 11)
+```
+
+## Niche composition summary
+
+```{r summary-table}
+summary_df <- lapply(names(enhanced_list), function(s) {
+  niche <- colData(enhanced_list[[s]])$niche
+  n     <- length(niche)
+  data.frame(
+    sample           = s,
+    n_subspots       = n,
+    pct_tumour       = round(100 * mean(niche == "Tumour"),       1),
+    pct_peritumoral  = round(100 * mean(niche == "Peritumoral"),  1),
+    pct_distal       = round(100 * mean(niche == "Distal"),       1)
+  )
+}) |> bind_rows()
+
+knitr::kable(summary_df, caption = "Niche zone composition per sample (% of enhanced sub-spots)")
+```
+
+## Immune cell composition by niche zone and ONC/IMI phenotype
+
+Immune cell type counts in Peritumoral and Distal zones, grouped by the
+ONC/IMI classification from V05 (`metadata/ONC_IMI_phenotypes.csv`).
+Tumour sub-spots are excluded (they carry the "Tumour" label, not an immune type).
+
+```{r immune-niche-barplot, fig.width = 14, fig.height = 6}
+marta_csv <- file.path(BASE, "metadata", "ONC_IMI_phenotypes.csv")
+
+  pheno_df  <- read.csv(marta_csv, stringsAsFactors = FALSE)
+  pheno_map <- setNames(pheno_df[,2], sub("^CUP-", "", pheno_df[,1]))
+
+  immune_df <- lapply(names(enhanced_list), function(s) {
+    cd    <- as.data.frame(colData(enhanced_list[[s]]))
+    pheno <- pheno_map[s]
+    if (is.na(pheno)) return(NULL)
+    cd |>
+      filter(niche %in% c("Peritumoral", "Distal"),
+             celltype != "Stroma") |>
+      mutate(
+        sample    = s,
+        phenotype = pheno,
+        celltype  = gsub("_", " ", celltype)
+      ) |>
+      count(sample, phenotype, niche, celltype, name = "n_subspots")
+  }) |> bind_rows()
+
+# Aggregate counts across samples within each phenotype group
+    plot_df <- immune_df |>
+      group_by(phenotype, niche, celltype) |>
+      summarise(total = sum(n_subspots), .groups = "drop") |>
+      mutate(
+        niche     = factor(niche, levels = c("Peritumoral", "Distal")),
+        phenotype = factor(phenotype, levels = c("ONC", "IMI"))
+      )
+
+# Stacked barplot Celltype distribution in Niche+Peritumoral vs Distal
+
+plot_df <- immune_df %>%
+  group_by(celltype) %>%
+  mutate(total_n = sum(n_subspots),
+  Location = case_when(
+        niche %in% c("Niche", "Peritumoral") ~ "Niche/Peritumoral",
+        niche == "Distal" ~ "Distal",
+        TRUE ~ niche
+    )) %>%
+  ungroup()
+
+# Barplot of grouped cell_type composition by Location
+
+ggplot(plot_df, aes(x = reorder(celltype, -total_n), y = n_subspots, fill = Location)) +
+  geom_bar(stat = "identity", position = "stack", width = 0.7) +
+  scale_fill_manual(values = c("Niche/Peritumoral" = "#0c797f", "Distal" = "#b45221")) +
+  labs(
+    title = "Cell Type Counts by Location (CUP)",
+    x = "",
+    y = "Sub-spot Count",
+    fill = "Location"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 11),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+dir.create(file.path(BASE, "Plots"), showWarnings = FALSE)
+ggsave(file.path(BASE, "Plots", "cell_type_counts_by_location_CUP.png"), width = 10, height = 6, dpi = 300)
+
+ggplot(plot_df, aes(x = Location, y = n_subspots, fill = Location)) +
+  geom_boxplot() +
+  facet_wrap(~ celltype, scales = "free_y") +
+  scale_fill_manual(values = c("Niche/Peritumoral" = "#0c797f", "Distal" = "#b45221")) +
+  labs(
+    title = "Cell Type Counts by Location (CUP)",
+    x = "",
+    y = "Sub-spot Count",
+    fill = "Location"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 30, hjust = 1, size = 11),
+    legend.position = "bottom",
+    plot.title = element_text(face = "bold")
+  )
+
+ggsave(file.path(BASE, "Plots", "cell_type_counts_by_location_boxplot_CUP.png"), width = 12, height = 8, dpi = 300)
+```
+
+## Cell type counts by ONC/IMI phenotype (all zones combined)
+
+Per-sample sub-spot counts for each immune cell type, collapsed across Peritumoral and
+Distal zones. One point per sample; ONC vs IMI compared with a two-sided
+Wilcoxon rank-sum test (p-value shown above each panel).
+
+```{r celltype-counts-onc-imi, fig.width = 12, fig.height = 6}
+marta_csv <- file.path(BASE, "metadata", "ONC_IMI_phenotypes.csv")
+
+if (file.exists(marta_csv)) {
+  pheno_df  <- read.csv(marta_csv, stringsAsFactors = FALSE)
+  pheno_map <- setNames(pheno_df[,2], sub("^CUP-", "", pheno_df[,1]))
+
+  counts_onc_imi <- lapply(names(enhanced_list), function(s) {
+    cd    <- as.data.frame(colData(enhanced_list[[s]]))
+    pheno <- pheno_map[s]
+    if (is.na(pheno)) return(NULL)
+    cd |>
+      filter(niche %in% c("Peritumoral", "Distal"),
+             !celltype %in% c("Tumour", "Stroma")) |>
+      mutate(sample    = s,
+             phenotype = pheno,
+             celltype  = gsub("_", " ", celltype)) |>
+      count(sample, phenotype, celltype, name = "n_subspots")
+  }) |> bind_rows() |>
+    mutate(phenotype = factor(phenotype, levels = c("ONC", "IMI")))
+
+  # Wilcoxon p-value and label position per cell type
+  ct_stats_counts <- counts_onc_imi |>
+    group_by(celltype) |>
+    summarise(
+      p_value = tryCatch(
+        wilcox.test(n_subspots[phenotype == "ONC"],
+                    n_subspots[phenotype == "IMI"],
+                    exact = FALSE)$p.value,
+        error = function(e) NA_real_
+      ),
+      y_pos = max(n_subspots, na.rm = TRUE) * 1.08,
+      .groups = "drop"
+    ) |>
+    mutate(p_label = dplyr::case_when(
+      is.na(p_value)  ~ "NA",
+      p_value < 0.001 ~ "p<0.001",
+      TRUE            ~ sprintf("p=%.3f", p_value)
+    ))
+
+  ct_order        <- ct_stats_counts |> arrange(p_value) |> pull(celltype)
+  counts_onc_imi  <- counts_onc_imi  |> mutate(celltype = factor(celltype, levels = ct_order))
+  ct_stats_counts <- ct_stats_counts |> mutate(celltype = factor(celltype, levels = ct_order))
+
+  ggplot(counts_onc_imi, aes(x = phenotype, y = n_subspots, fill = phenotype)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.5) +
+    geom_jitter(aes(colour = phenotype), width = 0.15, size = 2.2, alpha = 0.85) +
+    geom_text(data        = ct_stats_counts,
+              aes(x = 1.5, y = y_pos, label = p_label),
+              inherit.aes = FALSE, size = 3, colour = "grey30") +
+    facet_wrap(~ celltype, scales = "free_y", ncol = 4) +
+    scale_fill_manual(values  = c("ONC" = "#D73027", "IMI" = "#4575B4"),
+                      name = "Phenotype") +
+    scale_colour_manual(values = c("ONC" = "#D73027", "IMI" = "#4575B4"),
+                        name = "Phenotype") +
+    labs(
+      title    = "Immune cell type sub-spot counts by ONC/IMI phenotype",
+      x        = NULL,
+      y        = "Sub-spot count"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x     = element_text(angle = 30, hjust = 1, size = 9),
+      legend.position = "bottom",
+      plot.title      = element_text(face = "bold"),
+      strip.text      = element_text(size = 9, face = "bold")
+    )
+
+  ggsave(file.path(BASE, "Plots", "celltype_counts_onc_imi.png"),
+         width = 12, height = 6, dpi = 300)
+} else {
+  message("ONC_IMI_phenotypes.csv not found — skipping ONC/IMI cell type count plot.")
+}
+```
+
+## Immune cell log₂ enrichment by niche zone and ONC/IMI phenotype
+
+Mirrors the `log2_enrich` calculation in Xenium Script 14.
+For each sample, the global baseline is the proportional composition of all
+non-Tumour sub-spots (Peritumoral + Distal combined).
+
+$$\text{log}_2\text{-enrich} = \log_2\!\left(\frac{\%_\text{zone} + 0.001}{\%_\text{global} + 0.001}\right)$$
+
+Positive = cell type enriched in that zone relative to its overall abundance; negative = depleted.
+
+```{r enrich-compute}
+marta_csv <- file.path(BASE, "metadata", "ONC_IMI_phenotypes.csv")
+
+enrich_all <- NULL
+
+if (file.exists(marta_csv)) {
+  pheno_df  <- read.csv(marta_csv, stringsAsFactors = FALSE)
+  pheno_map <- setNames(pheno_df[,2], sub("^CUP-", "", pheno_df[,1]))
+
+  enrich_all <- lapply(names(enhanced_list), function(s) {
+    cd    <- as.data.frame(colData(enhanced_list[[s]]))
+    pheno <- pheno_map[s]
+    if (is.na(pheno)) return(NULL)
+
+    # Non-Tumour sub-spots only (exclude Stroma catch-all if present)
+    nt <- cd |> filter(niche %in% c("Peritumoral", "Distal"),
+                       !celltype %in% c("Tumour", "Stroma"))
+
+    # Global baseline: proportions across Peritumoral + Distal combined
+    global_tab <- table(nt$celltype)
+    global_n   <- max(sum(global_tab), 1)
+
+    lapply(c("Peritumoral", "Distal"), function(z) {
+      sub_z  <- nt |> filter(niche == z)
+      zone_tab <- table(sub_z$celltype)
+      zone_n   <- max(sum(zone_tab), 1)
+      types    <- union(names(global_tab), names(zone_tab))
+
+      pct_zone   <- as.integer(zone_tab[types])   / zone_n   * 100
+      pct_global <- as.integer(global_tab[types]) / global_n * 100
+      pct_zone[is.na(pct_zone)]     <- 0
+      pct_global[is.na(pct_global)] <- 0
+
+      tibble(
+        sample      = s,
+        phenotype   = pheno,
+        niche       = z,
+        cell_type   = gsub("_", " ", types),
+        pct         = pct_zone,
+        pct_global  = pct_global,
+        log2_enrich = log2((pct_zone / 100 + 0.001) / (pct_global / 100 + 0.001))
+      )
+    }) |> bind_rows()
+  }) |> bind_rows()
+} else {
+  message("V05 classification not found — skipping enrichment plots.")
+}
+```
+
+
+
+```{r enrich-heatmap, fig.width = 13, fig.height = 5}
+if (!is.null(enrich_all) && nrow(enrich_all) > 0 &&
+    requireNamespace("pheatmap", quietly = TRUE)) {
+  library(pheatmap)
+
+  peri_wide <- enrich_all |>
+    filter(niche == "Peritumoral") |>
+    select(sample, cell_type, log2_enrich) |>
+    pivot_wider(names_from = sample, values_from = log2_enrich, values_fill = 0) |>
+    column_to_rownames("cell_type") |>
+    as.matrix()
+
+  # Column annotation: ONC/IMI phenotype
+  tmp_df <- read.csv(file.path(BASE, "metadata", "ONC_IMI_phenotypes.csv"), stringsAsFactors = FALSE)
+  pheno_map2 <- setNames(tmp_df[,2], sub("^CUP-", "", tmp_df[,1]))
+  col_ann <- data.frame(
+    Phenotype = ifelse(is.na(pheno_map2[colnames(peri_wide)]),
+                       "Unknown", pheno_map2[colnames(peri_wide)]),
+    row.names = colnames(peri_wide)
+  )
+
+  max_abs <- max(abs(peri_wide), 2, na.rm = TRUE)
+  pal     <- colorRampPalette(
+    c("#313695","#4575B4","#74ADD1","#ABD9E9","white",
+      "#FDAE61","#F46D43","#D73027","#A50026")
+  )(101)
+  breaks  <- seq(-max_abs, max_abs, length.out = 102)
+
+  pheatmap(
+    peri_wide,
+    color             = pal,
+    breaks            = breaks,
+    cluster_rows      = TRUE,
+    cluster_cols      = TRUE,
+    annotation_col    = col_ann,
+    annotation_colors = list(
+      Phenotype = c("ONC" = "#D73027", "IMI" = "#4575B4", "Unknown" = "#888888")
+    ),
+    border_color      = NA,
+    fontsize          = 10,
+    fontsize_row      = 9,
+    fontsize_col      = 9,
+    main              = "Peritumoral immune enrichment (log₂) per sample",
+    legend_breaks     = c(floor(-max_abs), 0, ceiling(max_abs)),
+    legend_labels     = c(sprintf("Depleted\n(%.0f)", floor(-max_abs)),
+                          "Equal\n(0)",
+                          sprintf("Enriched\n(%.0f)", ceiling(max_abs)))
+  )
+}
+```
+
+## Spatial immune cell enrichment by ONC/IMI phenotype
+
+Mirrors Xenium Script 17b. For each niche zone and immune cell type, a two-sided
+Wilcoxon rank-sum test (ONC vs IMI) is run on per-sample log₂ enrichment
+scores with rank-biserial correlation as the effect size. Cell types are ordered by
+their maximum |r| across both zones. Zones shown: Peritumoral (< 100 µm) and Distal
+(≥ 100 µm), mirroring Script 17b's Niche/Peritumoral and Distal.
+
+```{r spatial-immune-enrichment, fig.width = 14, fig.height = 7}
+if (!is.null(enrich_all) && nrow(enrich_all) > 0) {
+
+  # Build wide matrices: samples × cell types, separately per zone
+  make_wide_mat <- function(df, zone_name) {
+    df |> filter(niche == zone_name) |>
+      select(sample, cell_type, log2_enrich) |>
+      pivot_wider(names_from = cell_type, values_from = log2_enrich, values_fill = 0) |>
+      column_to_rownames("sample") |> as.matrix()
+  }
+
+  peri_mat_e   <- make_wide_mat(enrich_all, "Peritumoral")
+  distal_mat_e <- make_wide_mat(enrich_all, "Distal")
+
+  # Phenotype vector from the manual phenotype CSV
+  pheno_csv_e  <- read.csv(file.path(BASE, "metadata", "ONC_IMI_phenotypes.csv"), stringsAsFactors = FALSE)
+  pheno_vec_e  <- setNames(pheno_csv_e[,2], sub("^CUP-", "", pheno_csv_e[,1]))
+  common_e     <- intersect(rownames(peri_mat_e), names(pheno_vec_e[!is.na(pheno_vec_e)]))
+  pheno_vec_e  <- pheno_vec_e[common_e]
+
+  # Effect size helper: rank-biserial r (matches Script 17b)
+  rank_bis_r <- function(x, y) {
+    n1 <- sum(!is.na(x)); n2 <- sum(!is.na(y))
+    if (n1 < 2 || n2 < 2) return(NA_real_)
+    W <- suppressWarnings(wilcox.test(x, y, exact = FALSE)$statistic)
+    as.numeric(1 - (2 * W) / (n1 * n2))
+  }
+
+  compute_zone_stats <- function(mat, pheno_vec, zone_name) {
+    samps <- intersect(rownames(mat), names(pheno_vec))
+    bind_rows(lapply(colnames(mat), function(ct) {
+      onc <- mat[samps[pheno_vec[samps] == "ONC"], ct, drop = TRUE]
+      imi <- mat[samps[pheno_vec[samps] == "IMI"], ct, drop = TRUE]
+      p   <- suppressWarnings(tryCatch(
+        wilcox.test(onc, imi, exact = FALSE)$p.value,
+        error = function(e) NA_real_))
+      tibble(cell_type = ct, niche = zone_name,
+             rank_biserial = rank_bis_r(onc, imi), p_value = p)
+    }))
+  }
+
+  stats_e <- bind_rows(
+    compute_zone_stats(peri_mat_e,   pheno_vec_e, "Peritumoral"),
+    compute_zone_stats(distal_mat_e, pheno_vec_e, "Distal")
+  )
+
+  # Order cell types by maximum |r| across both zones
+  ct_order_e <- stats_e |>
+    group_by(cell_type) |>
+    summarise(max_r = max(abs(rank_biserial), na.rm = TRUE), .groups = "drop") |>
+    arrange(desc(max_r)) |> pull(cell_type)
+
+  n_onc_e <- sum(pheno_vec_e == "ONC")
+  n_imi_e <- sum(pheno_vec_e == "IMI")
+
+  # Panel labels: cell_type × zone, Peritumoral panels first
+  panel_levels_e <- c(paste0(ct_order_e, "\n[Peritumoral]"),
+                      paste0(ct_order_e, "\n[Distal]"))
+
+  long_e <- enrich_all |>
+    filter(sample %in% common_e) |>
+    mutate(
+      panel_label = factor(paste0(cell_type, "\n[", niche, "]"),
+                           levels = panel_levels_e),
+      phenotype   = factor(phenotype, levels = c("ONC", "IMI"))
+    )
+
+  stats_e <- stats_e |>
+    mutate(
+      panel_label = factor(paste0(cell_type, "\n[", niche, "]"),
+                           levels = panel_levels_e),
+      eff_label   = sprintf("r = %.2f\np = %.3f", rank_biserial, p_value)
+    )
+
+  caption_e <- paste0(
+    "Log₂ enrichment of immune cell types relative to global tissue fraction, ",
+    "stratified by ONC (red, n=", n_onc_e, ") and IMI (blue, n=", n_imi_e, "). ",
+    "Left: Peritumoral zone (sub-spots < 100 µm from tumour). ",
+    "Right: Distal zone (≥ 100 µm). ",
+    "Columns ordered by maximum |rank-biserial r| across zones. ",
+    "r = rank-biserial correlation (effect size); ",
+    "p = two-sided Wilcoxon rank-sum test (unadjusted)."
+  )
+
+  ggplot(long_e, aes(x = phenotype, y = log2_enrich, fill = phenotype)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.5) +
+    geom_jitter(aes(colour = phenotype), width = 0.12, size = 2.2, alpha = 0.85) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+    geom_text(data        = stats_e,
+              aes(x = 1.5, y = Inf, label = eff_label),
+              vjust = 1.4, size = 3.2, colour = "grey40", inherit.aes = FALSE) +
+    facet_wrap(~ panel_label, ncol = length(ct_order_e), scales = "free_y") +
+    scale_fill_manual(values  = c("ONC" = "#D73027", "IMI" = "#4575B4"),
+                      name = "Phenotype") +
+    scale_colour_manual(values = c("ONC" = "#D73027", "IMI" = "#4575B4"),
+                        name = "Phenotype") +
+    labs(
+      title   = "Spatial immune cell enrichment by ONC/IMI phenotype",
+      x       = NULL,
+      y       = expression(log[2]~"enrichment vs global fraction"),
+      caption = caption_e
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      axis.text.x           = element_text(angle = 30, hjust = 1, size = 9),
+      legend.position       = "bottom",
+      plot.title            = element_text(face = "bold"),
+      strip.text            = element_text(size = 8, face = "bold"),
+      plot.caption          = element_text(size = 7.5, colour = "grey30",
+                                           hjust = 0, lineheight = 1.3,
+                                           margin = margin(t = 8)),
+      plot.caption.position = "plot"
+    )
+} else {
+  message("Enrichment data not available — run enrich-compute chunk first.")
+}
+```
+
+```{r focused-immune-enrichment, fig.width = 8, fig.height = 7}
+if (!is.null(enrich_all) && nrow(enrich_all) > 0 &&
+    exists("stats_e") && exists("long_e")) {
+
+  focus_cts <- c("Dendritic", "B_cells", "Monocytes")
+
+  panel_levels_f <- c(paste0(focus_cts, "\n[Peritumoral]"),
+                      paste0(focus_cts, "\n[Distal]"))
+
+  long_f <- long_e |>
+    filter(cell_type %in% focus_cts) |>
+    mutate(panel_label = factor(paste0(cell_type, "\n[", niche, "]"),
+                                levels = panel_levels_f))
+
+  stats_f <- stats_e |>
+    filter(cell_type %in% focus_cts) |>
+    mutate(panel_label = factor(paste0(cell_type, "\n[", niche, "]"),
+                                levels = panel_levels_f))
+
+  ggplot(long_f, aes(x = phenotype, y = log2_enrich, fill = phenotype)) +
+    geom_boxplot(alpha = 0.7, outlier.shape = NA, width = 0.5) +
+    geom_jitter(aes(colour = phenotype), width = 0.12, size = 3, alpha = 0.85) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+    geom_text(data        = stats_f,
+              aes(x = 1.5, y = Inf, label = eff_label),
+              vjust = 1.4, size = 3.5, colour = "grey40", inherit.aes = FALSE) +
+    facet_wrap(~ panel_label, ncol = 2, scales = "free_y") +
+    scale_fill_manual(values  = c("ONC" = "#D73027", "IMI" = "#4575B4"),
+                      name = "Phenotype") +
+    scale_colour_manual(values = c("ONC" = "#D73027", "IMI" = "#4575B4"),
+                        name = "Phenotype") +
+    labs(
+      title    = "Spatial immune cell enrichment by ONC/IMI phenotype",
+      subtitle = "Peritumoral (< 100 µm) and Distal (≥ 100 µm) zones",
+      x        = NULL,
+      y        = expression(log[2]~"enrichment vs global fraction")
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      axis.text.x     = element_text(angle = 30, hjust = 1, size = 10),
+      legend.position = "bottom",
+      plot.title      = element_text(face = "bold"),
+      strip.text      = element_text(size = 10, face = "bold")
+    )
+}
+
+ggsave(file.path(BASE, "Plots", "immune_enrichment_by_phenotype.png"),
+       width = 8, height = 10, dpi = 300)
+```
+
+## Data export
+
+```{r data-export}
+library(openxlsx)
+wb <- createWorkbook()
+
+# Sheet 1: per-sample cell type sub-spot counts (data behind celltype_counts_onc_imi.png)
+if (exists("counts_onc_imi") && nrow(counts_onc_imi) > 0) {
+  addWorksheet(wb, "celltype_counts")
+  writeData(wb, "celltype_counts",
+            counts_onc_imi |>
+              arrange(celltype, phenotype, sample) |>
+              select(sample, phenotype, celltype, n_subspots))
+}
+
+# Sheet 2: Wilcoxon stats for cell type counts ONC vs IMI
+if (exists("ct_stats_counts") && nrow(ct_stats_counts) > 0) {
+  addWorksheet(wb, "celltype_counts_stats")
+  writeData(wb, "celltype_counts_stats",
+            ct_stats_counts |>
+              arrange(p_value) |>
+              select(celltype, p_value, p_label))
+}
+
+# Sheet 3: per-sample log2 enrichment scores (data behind spatial enrichment plots)
+if (!is.null(enrich_all) && nrow(enrich_all) > 0) {
+  addWorksheet(wb, "log2_enrichment")
+  writeData(wb, "log2_enrichment",
+            enrich_all |>
+              arrange(cell_type, niche, phenotype, sample) |>
+              select(sample, phenotype, niche, cell_type, pct, pct_global, log2_enrich))
+}
+
+# Sheet 4: Wilcoxon stats for log2 enrichment ONC vs IMI (per cell type × niche)
+if (exists("stats_e") && nrow(stats_e) > 0) {
+  addWorksheet(wb, "enrichment_stats")
+  writeData(wb, "enrichment_stats",
+            stats_e |>
+              arrange(niche, p_value) |>
+              select(cell_type, niche, rank_biserial, p_value))
+}
+
+out_xlsx <- file.path(BASE, "Plots", "V06_plot_data.xlsx")
+saveWorkbook(wb, out_xlsx, overwrite = TRUE)
+cat(sprintf("Exported plot data → %s\n", out_xlsx))
+cat(sprintf("  celltype_counts       : %d rows\n",
+            if (exists("counts_onc_imi"))  nrow(counts_onc_imi)  else 0))
+cat(sprintf("  celltype_counts_stats : %d rows\n",
+            if (exists("ct_stats_counts")) nrow(ct_stats_counts) else 0))
+cat(sprintf("  log2_enrichment       : %d rows\n",
+            if (!is.null(enrich_all))      nrow(enrich_all)      else 0))
+cat(sprintf("  enrichment_stats      : %d rows\n",
+            if (exists("stats_e"))         nrow(stats_e)         else 0))
+```
+
+## Save checkpoint
+
+```{r save}
+saveRDS(enhanced_list, OUT_RDS)
+cat(sprintf("Saved %d SCEs with niche labels → %s\n", length(enhanced_list), OUT_RDS))
+```
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

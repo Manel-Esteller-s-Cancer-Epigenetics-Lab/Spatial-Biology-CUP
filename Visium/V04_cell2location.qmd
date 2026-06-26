@@ -1,0 +1,546 @@
+---
+title: "V04 — Cell2location Immune Deconvolution"
+author: "Abu Saadat"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: "right"
+    toc-title: "Contents"
+    toc-expand: true
+    code-fold: true
+    code-tools: false
+    code-summary: "Hide code"
+    lightbox: true
+    self-contained: true
+    fig-width: 14
+    fig-height: 7
+    fig-dpi: 150
+    cap-location: bottom
+    fontsize: 1.05em
+    linestretch: 1.6
+    theme:
+      light: "cosmo"
+      dark : "cyborg"
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+Cell2location (Kleshchevnikov et al., *Nature Biotechnology* 2022) is run on BayesSpace
+enhanced sub-spots to estimate immune cell type abundances at near-single-cell resolution.
+
+**Reference**: `purified_pbmc_dataset` (scVI-tools) — 10 purified immune populations,
+21 932 genes, 72.9% overlap with Visium panel. Subsampled to 2 000 cells per type;
+NB regression (`RegressionModel`) extracts cell type signatures.
+
+**Two-compartment analysis**:
+
+| Sub-spot compartment | Cell2location read-out |
+|----------------------|------------------------|
+| **CF3 Tumour** | Immune infiltration fraction (validates CF3; identifies immune-hot vs cold TME) |
+| **CF3 Stroma** | Immune subtype fractions — label by argmax |
+
+**Sub-spots per location**: `N_cells_per_location = 3` (BayesSpace sub-spots at ~25 µm
+contain fewer cells than full 55 µm spots; ~3 accounts for sub-spot overlap with cell bodies).
+
+**Input**: `visium_annotated_sce_list.rds`
+**Output**: `visium_celltypes_sce_list.rds`, `c2l_results/<sample>_abundances.csv`
+
+```{r setup}
+library(SingleCellExperiment)
+library(Matrix)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+BASE <- "."
+C2L_DIR    <- file.path(BASE, "c2l_results")
+REF_DIR    <- file.path(C2L_DIR, "reference")
+EXPORT_DIR <- file.path(C2L_DIR, "spatial_inputs")
+OUT_RDS    <- file.path(BASE, "visium_celltypes_sce_list.rds")
+
+for (d in c(C2L_DIR, REF_DIR, EXPORT_DIR))
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+
+enhanced_list <- readRDS(file.path(BASE, "visium_annotated_sce_list.rds"))
+
+# 10 immune populations — matches purified_pbmc_dataset cell_types mapping
+IMMUNE_TYPES <- c("B_cells", "Monocytes", "CD34_progenitor",
+                  "CD4_T", "NK_cells", "CD8_T",
+                  "Memory_T", "Naive_CD8_T", "Naive_T", "Treg")
+
+CT_COLOURS <- c(
+  "Tumour"         = "#C0392B",
+  "B_cells"        = "#4E79A7",
+  "Monocytes"      = "#F28E2B",
+  "CD34_progenitor"= "#BAB0AC",
+  "CD4_T"          = "#59A14F",
+  "NK_cells"       = "#6c4c8d",
+  "CD8_T"          = "#8CD17D",
+  "Memory_T"       = "#76B7B2",
+  "Naive_CD8_T"    = "#FFBE7D",
+  "Naive_T"        = "#B07AA1",
+  "Treg"           = "#FF9DA7"
+)
+```
+
+## Step 1 — Build immune reference (once, cached)
+
+```{r write-ref-script}
+ref_py <- file.path(REF_DIR, "build_reference.py")
+writeLines(c(
+  "import sys, os, warnings, numpy as np, pandas as pd",
+  "import anndata as ad, scanpy as sc",
+  "warnings.filterwarnings('ignore')",
+  "",
+  "output_dir = sys.argv[1]",
+  "os.makedirs(output_dir, exist_ok=True)",
+  "",
+  "# ── Load purified PBMC reference ─────────────────────────────────────",
+  "import scvi.data as sdata",
+  "ref = sdata.purified_pbmc_dataset()",
+  "",
+  "# Map raw cell_types to readable names",
+  "ct_map = {",
+  "    'b_cells'        : 'B_cells',",
+  "    'cd14_monocytes' : 'Monocytes',",
+  "    'cd34'           : 'CD34_progenitor',",
+  "    'cd4_t_helper'   : 'CD4_T',",
+  "    'cd56_nk'        : 'NK_cells',",
+  "    'cytotoxic_t'    : 'CD8_T',",
+  "    'memory_t'       : 'Memory_T',",
+  "    'naive_cytotoxic': 'Naive_CD8_T',",
+  "    'naive_t'        : 'Naive_T',",
+  "    'regulatory_t'   : 'Treg',",
+  "}",
+  "ref.obs['cell_type'] = ref.obs['cell_types'].map(ct_map)",
+  "ref = ref[ref.obs['cell_type'].notna()].copy()",
+  "",
+  "# Subsample to 2000 cells per type for tractability",
+  "rng = np.random.default_rng(42)",
+  "keep = []",
+  "for ct in ref.obs['cell_type'].unique():",
+  "    idx = np.where(ref.obs['cell_type'] == ct)[0]",
+  "    n   = min(len(idx), 2000)",
+  "    keep.extend(rng.choice(idx, n, replace=False).tolist())",
+  "ref = ref[np.sort(keep)].copy()",
+  "print(f'  Reference after subsampling: {ref.shape}')",
+  "",
+  "# Filter lowly expressed genes, select HVGs",
+  "sc.pp.filter_genes(ref, min_cells=10)",
+  "sc.pp.highly_variable_genes(ref, n_top_genes=3000, flavor='seurat_v3')",
+  "ref = ref[:, ref.var['highly_variable']].copy()",
+  "print(f'  After HVG selection: {ref.shape}')",
+  "",
+  "# ── Train RegressionModel ────────────────────────────────────────────",
+  "import torch",
+  "import cell2location as c2l",
+  "c2l.models.RegressionModel.setup_anndata(ref, labels_key='cell_type')",
+  "mod = c2l.models.RegressionModel(ref)",
+  "use_gpu = torch.cuda.is_available()",
+  "print(f'  Training RegressionModel (GPU={use_gpu})...')",
+  "mod.train(max_epochs=250, accelerator='gpu' if use_gpu else 'cpu')",
+  "",
+  "# ── Export signatures (means per cell type per gene) ─────────────────",
+  "ref = mod.export_posterior(ref, sample_kwargs={'num_samples': 500})",
+  "# varm is a DataFrame; assign column names directly to avoid reindex NaN",
+  "sig_df = ref.varm['means_per_cluster_mu_fg'].copy()",
+  "sig_df.columns = ref.uns['mod']['factor_names']",
+  "sig_csv = os.path.join(output_dir, 'cell_type_signatures.csv')",
+  "sig_df.to_csv(sig_csv)",
+  "print(f'  Signatures saved: {sig_df.shape} -> {sig_csv}')",
+  "print(f'  Cell types: {sig_df.columns.tolist()}')"
+), ref_py)
+```
+
+```{r build-reference, results='asis'}
+sig_csv   <- file.path(REF_DIR, "cell_type_signatures.csv")
+done_flag <- file.path(REF_DIR, "reference_done.flag")
+
+if (file.exists(done_flag)) {
+  cat("> Reference already built — loading signatures.\n\n")
+} else {
+  cat("> Building immune reference (purified PBMC, RegressionModel)...\n\n")
+  exit_code <- system(sprintf("conda run -n cell2loc_env python %s %s",
+                              shQuote(ref_py), shQuote(REF_DIR)))
+  if (exit_code != 0) stop("Reference building failed — check Python output above")
+  file.create(done_flag)
+  cat("> Reference built and cached.\n\n")
+}
+
+sig_df <- read.csv(sig_csv, row.names = 1, check.names = FALSE)
+cat(sprintf("Signatures: %d genes × %d cell types\n\n", nrow(sig_df), ncol(sig_df)))
+knitr::kable(t(head(sig_df, 3)), digits = 3,
+             caption = "Cell type signature sample (first 3 genes)")
+```
+
+## Step 2 — Export spatial inputs
+
+```{r export-spatial}
+for (s in names(enhanced_list)) {
+  exp_dir   <- file.path(EXPORT_DIR, s)
+  done_flag <- file.path(exp_dir, "export_done.flag")
+  dir.create(exp_dir, showWarnings = FALSE)
+
+  if (file.exists(done_flag)) next
+
+  sce_enh <- enhanced_list[[s]]
+
+  # Convert logcounts → pseudo-counts (genes × sub-spots)
+  lc  <- assay(sce_enh, "logcounts")
+  pc  <- Matrix::Matrix(expm1(as.matrix(lc)), sparse = TRUE)
+
+  Matrix::writeMM(pc, file.path(exp_dir, "counts.mtx"))   # genes × sub-spots
+  writeLines(rownames(sce_enh), file.path(exp_dir, "genes.txt"))
+  writeLines(colnames(sce_enh), file.path(exp_dir, "barcodes.txt"))
+
+  # Compartment labels for stratified analysis
+  meta_df <- data.frame(
+    barcode    = colnames(sce_enh),
+    compartment = colData(sce_enh)$compartment,
+    array_row  = colData(sce_enh)$array_row,
+    array_col  = colData(sce_enh)$array_col
+  )
+  write.csv(meta_df, file.path(exp_dir, "metadata.csv"), row.names = FALSE)
+  file.create(done_flag)
+}
+cat(sprintf("Spatial inputs exported for %d samples\n", length(enhanced_list)))
+```
+
+## Step 3 — Run cell2location per sample
+
+```{r write-c2l-script}
+c2l_py <- file.path(C2L_DIR, "run_cell2location.py")
+writeLines(c(
+  "import sys, os, warnings, numpy as np, pandas as pd",
+  "import scipy.io, anndata as ad",
+  "warnings.filterwarnings('ignore')",
+  "",
+  "input_dir, sig_csv, output_csv = sys.argv[1:4]",
+  "sample_name = os.path.basename(input_dir)",
+  "",
+  "# ── Load spatial counts ───────────────────────────────────────────────",
+  "mat      = scipy.io.mmread(os.path.join(input_dir, 'counts.mtx')).T.tocsr()  # spots × genes",
+  "genes    = open(os.path.join(input_dir, 'genes.txt')).read().splitlines()",
+  "barcodes = open(os.path.join(input_dir, 'barcodes.txt')).read().splitlines()",
+  "adata    = ad.AnnData(X=mat, obs=pd.DataFrame(index=barcodes),",
+  "                      var=pd.DataFrame(index=genes))",
+  "print(f'  Spatial: {adata.shape}')",
+  "",
+  "# ── Load reference signatures ─────────────────────────────────────────",
+  "sig_df = pd.read_csv(sig_csv, index_col=0)",
+  "",
+  "# ── Intersect and align genes ─────────────────────────────────────────",
+  "common = sorted(set(adata.var_names) & set(sig_df.index))",
+  "adata  = adata[:, common].copy()",
+  "sig_df = sig_df.loc[common]   # aligned order",
+  "print(f'  Common genes: {len(common)}')",
+  "",
+  "# Round to integers — cell2location NB model requires count-like data",
+  "import scipy.sparse as sp",
+  "adata.X = sp.csr_matrix(np.round(adata.X.toarray()).astype(np.float32))",
+  "",
+  "# Remove spots with zero counts after gene intersection + rounding",
+  "sc_counts = np.asarray(adata.X.sum(axis=1)).flatten()",
+  "adata = adata[sc_counts > 0].copy()",
+  "print(f'  Spots after zero-count filter: {adata.n_obs}')",
+  "",
+  "# ── Run Cell2location ─────────────────────────────────────────────────",
+  "import torch",
+  "import cell2location as c2l",
+  "c2l.models.Cell2location.setup_anndata(adata)",
+  "# N_cells_per_location=3: BayesSpace sub-spots ~25µm contain ~2-5 cells",
+  "# detection_alpha=200: tighter prior for equalized BayesSpace sub-spot counts",
+  "mod = c2l.models.Cell2location(",
+  "    adata,",
+  "    cell_state_df         = sig_df,",
+  "    N_cells_per_location  = 3,",
+  "    detection_alpha       = 200,",
+  ")",
+  "use_gpu = torch.cuda.is_available()",
+  "print(f'  Training Cell2location (GPU={use_gpu}, max_epochs=3000)...')",
+  "mod.train(",
+  "    max_epochs  = 3000,",
+  "    batch_size  = 2048,",
+  "    train_size  = 1,",
+  "    accelerator = 'gpu' if use_gpu else 'cpu',",
+  ")",
+  "",
+  "# ── Export posterior q05 abundances ──────────────────────────────────",
+  "adata = mod.export_posterior(",
+  "    adata,",
+  "    sample_kwargs = {'num_samples': 500, 'batch_size': 2048},",
+  "    add_to_obsm   = ['q05'],",
+  ")",
+  "# q05_cell_abundance_w_sf: DataFrame (spots × cell_types)",
+  "abund_df = adata.obsm['q05_cell_abundance_w_sf'].copy()",
+  "abund_df.index = adata.obs_names",
+  "# Strip obsm-key prefix from column names → plain cell type names",
+  "abund_df.columns = [c.split('w_sf_', 1)[-1] for c in abund_df.columns]",
+  "",
+  "# Fractional abundances: normalise each spot to sum=1",
+  "row_sums = abund_df.sum(axis=1).replace(0, np.nan)",
+  "frac_df  = abund_df.div(row_sums, axis=0).fillna(0)",
+  "frac_df['dominant_immune'] = frac_df.idxmax(axis=1)",
+  "frac_df['total_immune_q05'] = abund_df.sum(axis=1)",
+  "frac_df['barcode'] = frac_df.index",
+  "",
+  "os.makedirs(os.path.dirname(output_csv), exist_ok=True)",
+  "frac_df.to_csv(output_csv, index=False)",
+  "print(f'  Saved: {output_csv} ({len(frac_df)} spots)')"
+), c2l_py)
+```
+
+```{r run-c2l, results='asis'}
+c2l_failed <- character(0)
+
+for (s in names(enhanced_list)) {
+  out_csv   <- file.path(C2L_DIR, paste0(s, "_abundances.csv"))
+  done_flag <- file.path(C2L_DIR, paste0(s, "_c2l_done.flag"))
+
+  if (file.exists(done_flag)) {
+    cat(sprintf("**%s**: already done — skipping\n\n", s)); next
+  }
+
+  cat(sprintf("\n---\n\n### %s\n\n", s))
+
+  cmd <- sprintf("conda run -n cell2loc_env python %s %s %s %s",
+                 shQuote(c2l_py),
+                 shQuote(file.path(EXPORT_DIR, s)),
+                 shQuote(sig_csv),
+                 shQuote(out_csv))
+  exit_code <- system(cmd)
+
+  if (exit_code != 0) {
+    warning(sprintf("Cell2location failed for %s — skipping", s))
+    cat(sprintf("  **SKIPPED** (cell2location failed)\n\n"))
+    c2l_failed <- c(c2l_failed, s)
+    next
+  }
+  file.create(done_flag)
+  cat(sprintf("  Cell2location complete → %s\n\n", out_csv))
+}
+
+if (length(c2l_failed) > 0)
+  cat(sprintf("\n> **%d sample(s) skipped**: %s\n\n",
+              length(c2l_failed), paste(c2l_failed, collapse = ", ")))
+```
+
+## Import cell2location results
+
+```{r import-c2l, results='asis'}
+c2l_annotations <- list()
+
+for (s in names(enhanced_list)) {
+  out_csv <- file.path(C2L_DIR, paste0(s, "_abundances.csv"))
+  if (!file.exists(out_csv)) next
+
+  df <- read.csv(out_csv, stringsAsFactors = FALSE)
+  rownames(df) <- df$barcode
+  c2l_annotations[[s]] <- df
+
+  n_spots <- nrow(df)
+  top_pop <- names(sort(table(df$dominant_immune), decreasing = TRUE))[1:3]
+  cat(sprintf("**%s**: %d spots | top immune pops: %s\n\n",
+              s, n_spots, paste(top_pop, collapse = ", ")))
+}
+
+# Assign final celltype to SCE objects
+# Tumour sub-spots (CF3): keep "Tumour" label; store c2l immune fraction for TME analysis
+# Stroma sub-spots (CF3): label with dominant_immune from cell2location
+enhanced_list <- setNames(lapply(names(enhanced_list), function(s) {
+  sce  <- enhanced_list[[s]]
+  ann  <- c2l_annotations[[s]]
+  if (is.null(ann)) {
+    colData(sce)$celltype       <- colData(sce)$compartment
+    colData(sce)$c2l_immune_frac <- NA_real_
+    colData(sce)$c2l_dominant    <- NA_character_
+    return(sce)
+  }
+  idx <- match(colnames(sce), ann$barcode)
+
+  # Dominant immune type from cell2location (used for stroma)
+  colData(sce)$c2l_dominant    <- ann$dominant_immune[idx]
+  colData(sce)$c2l_immune_frac <- ann$total_immune_q05[idx]
+
+  # Final celltype: CF3 Tumour wins; stroma gets c2l dominant type
+  colData(sce)$celltype <- ifelse(
+    colData(sce)$compartment == "Tumour",
+    "Tumour",
+    ann$dominant_immune[idx]
+  )
+  # Replace NA celltypes (spots not in c2l output) with compartment label
+  na_mask <- is.na(colData(sce)$celltype)
+  colData(sce)$celltype[na_mask] <- colData(sce)$compartment[na_mask]
+  sce
+}), names(enhanced_list))
+```
+
+## CF3 Tumour sub-spots — immune infiltration (TME analysis)
+
+Cell2location estimates immune cell abundance in CF3-labelled Tumour sub-spots.
+High total immune fraction = immune-hot TME; low = immune-excluded.
+
+```{r tumor-immune-infiltration, fig.height=5}
+tme_df <- lapply(names(enhanced_list), function(s) {
+  ann <- c2l_annotations[[s]]
+  if (is.null(ann)) return(NULL)
+  meta <- read.csv(file.path(EXPORT_DIR, s, "metadata.csv"),
+                   stringsAsFactors = FALSE)
+  df <- merge(ann, meta, by = "barcode")
+  df$sample <- s
+  df[df$compartment == "Tumour", ]
+}) |> bind_rows()
+
+if (nrow(tme_df) > 0) {
+  # Total immune fraction distribution across tumour sub-spots per sample
+  p1 <- ggplot(tme_df, aes(x = sample, y = total_immune_q05, fill = sample)) +
+    geom_violin(scale = "width", linewidth = 0.3, show.legend = FALSE, alpha = 0.8) +
+    geom_boxplot(width = 0.06, outlier.size = 0.3, fill = "white",
+                 show.legend = FALSE) +
+    labs(title = "Total immune abundance in CF3-Tumour sub-spots",
+         subtitle = "Higher = immune-infiltrated TME",
+         x = NULL, y = "Cell2location total immune q05") +
+    theme_classic(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+  # Immune composition within tumour sub-spots
+  pop_cols <- intersect(IMMUNE_TYPES, colnames(tme_df))
+  tme_long <- tme_df |>
+    select(sample, all_of(pop_cols)) |>
+    pivot_longer(all_of(pop_cols), names_to = "cell_type", values_to = "fraction") |>
+    group_by(sample, cell_type) |>
+    summarise(mean_frac = mean(fraction, na.rm = TRUE), .groups = "drop")
+
+  p2 <- ggplot(tme_long, aes(x = sample, y = mean_frac, fill = cell_type)) +
+    geom_col(width = 0.75) +
+    scale_fill_manual(values = CT_COLOURS, na.value = "#95A5A6") +
+    labs(title = "Immune composition in CF3-Tumour sub-spots",
+         x = NULL, y = "Mean cell2location fraction", fill = "Cell type") +
+    theme_classic(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "right")
+
+  p1 / p2
+}
+```
+
+## CF3 Stroma sub-spots — immune subtype composition
+
+```{r stroma-immune-composition, fig.height=5}
+stroma_df <- lapply(names(enhanced_list), function(s) {
+  ann <- c2l_annotations[[s]]
+  if (is.null(ann)) return(NULL)
+  meta <- read.csv(file.path(EXPORT_DIR, s, "metadata.csv"),
+                   stringsAsFactors = FALSE)
+  df <- merge(ann, meta, by = "barcode")
+  df$sample <- s
+  df[df$compartment == "Stroma", ]
+}) |> bind_rows()
+
+if (nrow(stroma_df) > 0) {
+  pop_cols <- intersect(IMMUNE_TYPES, colnames(stroma_df))
+  str_long <- stroma_df |>
+    select(sample, all_of(pop_cols)) |>
+    pivot_longer(all_of(pop_cols), names_to = "cell_type", values_to = "fraction") |>
+    group_by(sample, cell_type) |>
+    summarise(mean_frac = mean(fraction, na.rm = TRUE), .groups = "drop") |>
+    group_by(sample) |>
+    mutate(pct = 100 * mean_frac / sum(mean_frac)) |>
+    ungroup()
+
+  ggplot(str_long, aes(x = sample, y = pct, fill = cell_type)) +
+    geom_col(width = 0.75) +
+    scale_fill_manual(values = CT_COLOURS, na.value = "#95A5A6") +
+    labs(title = "Immune subtype composition in CF3-Stroma sub-spots",
+         x = NULL, y = "% of immune abundance", fill = "Cell type") +
+    theme_classic(base_size = 11) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          legend.position = "right")
+}
+```
+
+## Spatial cell type maps
+
+```{r spatial-maps, fig.height=4.5, results='asis'}
+for (s in names(enhanced_list)) {
+  if (is.null(c2l_annotations[[s]])) next
+  cat(sprintf("\n#### %s\n\n", s))
+  sce <- enhanced_list[[s]]
+
+  df <- data.frame(
+    col      = colData(sce)$array_col,
+    row      = colData(sce)$array_row,
+    celltype = colData(sce)$celltype
+  )
+
+  p <- ggplot(df, aes(col, -row, colour = celltype)) +
+    geom_point(size = 0.35, alpha = 0.8) +
+    coord_fixed() +
+    scale_colour_manual(values = CT_COLOURS, na.value = "#95A5A6") +
+    labs(title = s, colour = NULL) +
+    theme_classic(base_size = 11) +
+    theme(
+      panel.background  = element_rect(fill = "black"),
+      plot.background   = element_rect(fill = "black"),
+      axis.line         = element_line(colour = "white"),
+      axis.text         = element_text(colour = "white"),
+      axis.title        = element_text(colour = "white"),
+      plot.title        = element_text(colour = "white"),
+      legend.background = element_rect(fill = "black"),
+      legend.text       = element_text(colour = "white"),
+      legend.key        = element_rect(fill = "black")
+    ) +
+    guides(colour = guide_legend(override.aes = list(size = 2.5)))
+
+  print(p)
+  cat("\n")
+}
+```
+
+## Summary table
+
+```{r summary-table}
+summary_df <- lapply(names(enhanced_list), function(s) {
+  ct  <- colData(enhanced_list[[s]])$celltype
+  com <- colData(enhanced_list[[s]])$compartment
+  n   <- length(ct)
+  data.frame(
+    sample       = s,
+    n_subspots   = n,
+    pct_tumour   = round(100 * mean(com == "Tumour", na.rm = TRUE), 1),
+    pct_cd8_t    = round(100 * mean(ct == "CD8_T",    na.rm = TRUE), 1),
+    pct_cd4_t    = round(100 * mean(ct %in% c("CD4_T","Treg","Memory_T","Naive_T"), na.rm = TRUE), 1),
+    pct_mono     = round(100 * mean(ct == "Monocytes", na.rm = TRUE), 1),
+    pct_nk       = round(100 * mean(ct == "NK_cells",  na.rm = TRUE), 1),
+    pct_b        = round(100 * mean(ct == "B_cells",   na.rm = TRUE), 1)
+  )
+}) |> bind_rows()
+
+knitr::kable(summary_df,
+             col.names = c("Sample", "Sub-spots", "% Tumour",
+                           "% CD8 T", "% CD4/Treg/Mem T", "% Mono", "% NK", "% B"),
+             caption = "Cell type composition per sample (cell2location, enhanced sub-spots)")
+```
+
+## Save checkpoint
+
+```{r save}
+if (length(c2l_failed) > 0) {
+  cat(sprintf("Excluding %d failed sample(s): %s\n",
+              length(c2l_failed), paste(c2l_failed, collapse = ", ")))
+  enhanced_list <- enhanced_list[setdiff(names(enhanced_list), c2l_failed)]
+}
+saveRDS(enhanced_list, OUT_RDS)
+cat(sprintf("Saved %d annotated SCEs → %s\n", length(enhanced_list), OUT_RDS))
+```
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

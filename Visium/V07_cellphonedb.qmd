@@ -1,0 +1,1112 @@
+---
+title: "V07 — Ligand–Receptor Analysis (CellPhoneDB)"
+author: "Abu Saadat"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: "right"
+    toc-title: "Contents"
+    toc-expand: true
+    code-fold: true
+    code-tools: false
+    code-summary: "Hide code"
+    lightbox: true
+    self-contained: true
+    fig-width: 12
+    fig-height: 7
+    fig-dpi: 150
+    cap-location: bottom
+    fontsize: 1.05em
+    linestretch: 1.6
+    theme:
+      light: "cosmo"
+      dark : "cyborg"
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+Ligand–receptor interaction analysis using **LIANA v1.7.1** (standard CellPhoneDB method)
+per sample. Cell type labels come from CancerFinder3 (Tumour/Stroma) and cell2location
+(immune subtypes within stroma) from V04.
+
+Analysis is restricted to the **tumour–immune interface**: V06 (`visium_niches_sce_list.rds`)
+classifies each sub-spot into `niche = "Tumour" / "Peritumoral" / "Distal"`.
+Only **Peritumoral** stroma sub-spots (< 100 µm from nearest Tumour sub-spot) plus a
+subsampled set of Tumour sub-spots are passed to LIANA — mirroring the Xenium pipeline
+(Script 15) where niche zone cells are pre-selected before LIANA, making results
+directly comparable across platforms.
+
+**Input**: `visium_niches_sce_list.rds` (V06)
+**Output**: `cpdb_results/<sample>/liana_results.csv`, consolidated dot plots
+
+```{r setup}
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(patchwork)
+
+BASE        <- "."
+CPDB_DIR    <- file.path(BASE, "cpdb_results")
+CPDB_INPUT  <- file.path(BASE, "cpdb_input")
+
+MAX_PER_TYPE <- 400    # max Peritumoral sub-spots per immune cell type (mirrors Script 15)
+MAX_TUMOUR   <- 1500   # max Tumour sub-spots per sample
+
+dir.create(CPDB_DIR,   showWarnings = FALSE, recursive = TRUE)
+dir.create(CPDB_INPUT, showWarnings = FALSE, recursive = TRUE)
+
+# V06 adds colData$niche ("Tumour" / "Peritumoral" / "Distal") and dist_to_tumour
+enhanced_list <- readRDS(file.path(BASE, "visium_niches_ucd_sce_list.rds"))
+
+CPDB_IN_DIR  <- file.path(BASE, "cpdb_ucd_input")
+CPDB_OUT_DIR <- file.path(BASE, "cpdb_ucd_results")
+```
+
+## Export per sample for CellPhoneDB
+
+For each sample, sub-spots are pre-filtered to the tumour–immune interface before export:
+
+1. **Niche selection**: `niche == "Peritumoral"` sub-spots from V06 (stroma within 100 µm
+   of nearest Tumour sub-spot) plus all Tumour sub-spots.
+2. **Subsampling**: ≤ `MAX_PER_TYPE` per immune cell type, ≤ `MAX_TUMOUR` Tumour
+   sub-spots — mirrors Script 15's stratified subsample.
+3. **Expression + metadata** of the filtered set exported for LIANA.
+
+```{r export-cpdb, results='asis'}
+set.seed(42)
+for (s in names(enhanced_list)) {
+  sdir  <- file.path(CPDB_INPUT, s)
+  dir.create(sdir, showWarnings = FALSE)
+
+  done_flag <- file.path(sdir, "export_done.flag")
+  if (file.exists(done_flag)) {
+    cat(sprintf("**%s**: export already done — skipping\n\n", s))
+    next
+  }
+
+  cat(sprintf("\n---\n\n### %s\n\n", s))
+  sce_enh <- enhanced_list[[s]]
+  cd      <- as.data.frame(colData(sce_enh))
+
+  tumour_idx <- which(cd$niche == "Tumour")
+  peri_idx   <- which(cd$niche == "Peritumoral")
+
+  if (length(tumour_idx) == 0 || length(peri_idx) == 0) {
+    cat(sprintf("  **%s**: no Tumour or Peritumoral sub-spots — skipping\n\n", s)); next
+  }
+
+  # --- Stratified subsample of Peritumoral stroma (mirrors Script 15) ---
+  peri_celltypes <- cd$celltype[peri_idx]
+  keep_peri <- unlist(lapply(unique(peri_celltypes), function(ct) {
+    idx <- peri_idx[peri_celltypes == ct]
+    if (length(idx) > MAX_PER_TYPE) sample(idx, MAX_PER_TYPE) else idx
+  }))
+  keep_tumour <- if (length(tumour_idx) > MAX_TUMOUR)
+    sample(tumour_idx, MAX_TUMOUR) else tumour_idx
+  keep_idx <- c(keep_peri, keep_tumour)
+
+  cat(sprintf("  Peritumoral: %d → subsampled %d | Tumour: %d → subsampled %d\n\n",
+              length(peri_idx),   length(keep_peri),
+              length(tumour_idx), length(keep_tumour)))
+
+  sce_sub <- sce_enh[, keep_idx]
+  cd_sub  <- cd[keep_idx, ]
+
+  # --- Expression matrix (log-normalised, genes × sub-spots) ---
+  lc_sparse <- assay(sce_sub, "logcounts")
+  expressed <- Matrix::rowMeans(lc_sparse > 0) >= 0.01
+  lc        <- as.matrix(lc_sparse[expressed, ])
+  expr_df   <- cbind(Gene = rownames(lc), as.data.frame(lc))
+  write.table(expr_df,
+              file  = file.path(sdir, "normalised_counts.txt"),
+              sep   = "\t", quote = FALSE, row.names = FALSE)
+
+  # --- Cell type metadata ---
+  meta_df <- data.frame(Cell      = colnames(sce_sub),
+                        cell_type = cd_sub$celltype,
+                        stringsAsFactors = FALSE)
+  write.table(meta_df,
+              file  = file.path(sdir, "metadata.txt"),
+              sep   = "\t", quote = FALSE, row.names = FALSE)
+
+  file.create(done_flag)
+}
+```
+
+## Run LIANA CellPhoneDB
+
+Standard LIANA v1.7.1 CellPhoneDB on the pre-filtered niche sub-spots, via the
+`squidpy` conda environment. Matches the Xenium pipeline (Script 15) exactly.
+
+```{r write-liana-helper}
+py_script <- file.path(CPDB_INPUT, "run_liana.py")
+writeLines(c(
+  "import sys, os, warnings",
+  "warnings.filterwarnings('ignore')",
+  "import pandas as pd, anndata as ad, scipy.sparse as sp",
+  "import liana",
+  "",
+  "input_dir, output_dir, sample_name = sys.argv[1:4]",
+  "",
+  "counts = pd.read_csv(os.path.join(input_dir, 'normalised_counts.txt'),",
+  "                     sep='\\t', index_col='Gene')",
+  "meta   = pd.read_csv(os.path.join(input_dir, 'metadata.txt'),",
+  "                     sep='\\t', index_col='Cell')",
+  "",
+  "adata = ad.AnnData(X=sp.csr_matrix(counts.values.T))",
+  "adata.obs_names = counts.columns.tolist()",
+  "adata.var_names = counts.index.tolist()",
+  "common = adata.obs_names.intersection(meta.index)",
+  "adata  = adata[common].copy()",
+  "adata.obs['cell_type'] = meta.loc[common, 'cell_type'].values",
+  "",
+  "ct_counts   = adata.obs['cell_type'].value_counts()",
+  "valid_types = ct_counts[ct_counts >= 5].index.tolist()",
+  "adata = adata[adata.obs['cell_type'].isin(valid_types)].copy()",
+  "print(f'  {adata.n_obs} sub-spots x {adata.n_vars} genes | {len(valid_types)} cell types')",
+  "",
+  "liana.method.cellphonedb(",
+  "    adata,",
+  "    groupby       = 'cell_type',",
+  "    resource_name = 'cellphonedb',",
+  "    expr_prop     = 0.05,",
+  "    min_cells     = 5,",
+  "    n_perms       = 1000,",
+  "    seed          = 42,",
+  "    n_jobs        = 4,",
+  "    use_raw       = False,",
+  "    inplace       = True,",
+  "    verbose       = False,",
+  ")",
+  "",
+  "res = adata.uns['liana_res'].copy()",
+  "res['sample'] = sample_name",
+  "os.makedirs(output_dir, exist_ok=True)",
+  "out = os.path.join(output_dir, 'liana_results.csv')",
+  "res.to_csv(out, index=False)",
+  "print(f'  Saved {len(res)} interactions → {out}')"
+), py_script)
+```
+
+```{r run-liana, results='asis'}
+for (s in names(enhanced_list)) {
+  sdir      <- file.path(CPDB_INPUT, s)
+  out_dir   <- file.path(CPDB_DIR, s)
+  done_flag <- file.path(out_dir, "liana_done.flag")
+
+  if (file.exists(done_flag)) {
+    cat(sprintf("**%s**: LIANA already run — skipping\n\n", s))
+    next
+  }
+
+  dir.create(out_dir, showWarnings = FALSE)
+  cat(sprintf("\n---\n\n### %s\n\n", s))
+
+  cmd <- sprintf("conda run -n squidpy python %s %s %s %s",
+                 shQuote(py_script),
+                 shQuote(sdir),
+                 shQuote(out_dir),
+                 shQuote(s))
+
+  exit_code <- system(cmd)
+  if (exit_code != 0) {
+    warning(sprintf("LIANA failed for %s (exit code %d)", s, exit_code))
+    next
+  }
+  file.create(done_flag)
+  cat(sprintf("  LIANA complete → %s\n\n", out_dir))
+}
+```
+
+## Import results and filter significant interactions
+
+```{r import-results}
+liana_results <- lapply(names(enhanced_list), function(s) {
+  f <- file.path(CPDB_DIR, s, "liana_results.csv")
+  if (!file.exists(f)) {
+    message(sprintf("No LIANA results for %s — skipping", s)); return(NULL)
+  }
+  res <- read.csv(f, stringsAsFactors = FALSE)
+  res$sample <- s
+  res
+})
+names(liana_results) <- names(enhanced_list)
+liana_results        <- Filter(Negate(is.null), liana_results)
+cat(sprintf("LIANA results loaded for %d / %d samples\n",
+            length(liana_results), length(enhanced_list)))
+```
+
+## Tumour ↔ immune interaction dot plots
+
+Focus on interactions between Tumour sub-spots and immune cell types (T cells,
+Monocytes/Macrophages, B cells, NK cells).
+
+```{r dotplots, fig.height=8, results='asis'}
+# Exclude Tumour-Tumour interactions, only keep Tumour-Immune and Immune-Tumour.
+immune_types <- c("T_cells", "B_cells", "Monocytes", "NK_cells", "Dendritic", "Neutrophil", "Mast")
+
+for (s in names(liana_results)) {
+  cat(sprintf("\n---\n\n#### %s\n\n", s))
+  res <- liana_results[[s]]
+
+  # Label the cell-type pair and the LR interaction
+  res$pair             <- paste(res$source, res$target, sep = "|")
+  res$interacting_pair <- paste(res$ligand_complex, res$receptor_complex, sep = "_")
+
+  # Keep only Tumour ↔ immune pairs
+  tumour_immune <- res[
+    grepl("Tumour", res$pair) &
+    sapply(res$pair, function(x)
+      any(sapply(immune_types, function(it) grepl(it, x, ignore.case = TRUE)))),
+  ]
+
+  if (nrow(tumour_immune) == 0) {
+    cat("  No Tumour–immune interaction columns found.\n\n"); next
+  }
+
+  sig <- tumour_immune[!is.na(tumour_immune$cellphone_pvals) &
+                         tumour_immune$cellphone_pvals < 0.05, ]
+
+  if (nrow(sig) == 0) {
+    cat("  No significant interactions (p < 0.05).\n\n"); next
+  }
+
+  # Top 30 by smallest p-value
+  sig <- sig[order(sig$cellphone_pvals), ][seq_len(min(30L, nrow(sig))), ]
+
+  plot_df <- sig |>
+    mutate(neg_log10_p = -log10(cellphone_pvals + 1e-4))
+
+  p <- ggplot(plot_df, aes(x = pair, y = interacting_pair,
+                           size = neg_log10_p, colour = lr_means)) +
+    geom_point() +
+    scale_size_continuous(name = "-log10(p)", range = c(1, 6)) +
+    scale_colour_gradientn(colours = c("#2166AC","white","#D6604D"),
+                           name = "Mean expr.") +
+    labs(title = sprintf("%s — Tumour ↔ immune interactions (top %d, p < 0.05)",
+                         s, nrow(sig)),
+         x = "Cell type pair", y = "Interacting pair") +
+    theme_classic(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 8),
+          axis.text.y = element_text(size = 8))
+
+  print(p)
+  cat("\n")
+}
+```
+
+## Consolidated Tumour ↔ Immune interaction plot
+
+Top 20 interactions per direction that are significant (p < 0.05) in **≥3 samples**,
+split into **Tumour → Immune** and **Immune → Tumour** panels.
+Dot size = −log₁₀(mean p-value), colour = number of samples with significant interaction.
+
+```{r consolidated-plot, fig.width=16, fig.height=9}
+all_res <- bind_rows(liana_results)
+
+# Export 1: full per-sample results (with sample column)
+write.csv(all_res,
+          file      = file.path(CPDB_DIR, "pooled_liana_results.csv"),
+          row.names = FALSE)
+
+# Export 2: consolidated (no sample column, no duplicates) — significant interactions,
+# one row per unique source/target/ligand/receptor pair, values averaged across samples.
+consolidated <- all_res |>
+  filter(!is.na(cellphone_pvals), cellphone_pvals < 0.05,
+         !is.na(lr_means),        lr_means > 0) |>
+  group_by(ligand, ligand_complex, receptor, receptor_complex, source, target) |>
+  summarise(
+    n_samples      = n(),
+    ligand_means   = mean(ligand_means,   na.rm = TRUE),
+    ligand_props   = mean(ligand_props,   na.rm = TRUE),
+    receptor_means = mean(receptor_means, na.rm = TRUE),
+    receptor_props = mean(receptor_props, na.rm = TRUE),
+    lr_means       = mean(lr_means,       na.rm = TRUE),
+    cellphone_pvals = mean(cellphone_pvals, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(n_samples >= 3) |>
+  select(ligand, ligand_complex, ligand_means, ligand_props,
+         receptor, receptor_complex, receptor_means, receptor_props,
+         source, target, lr_means, cellphone_pvals, n_samples)
+
+write.csv(consolidated,
+          file      = file.path(CPDB_DIR, "LIANA_Visium.csv"),
+          row.names = FALSE)
+cat(sprintf("pooled_liana_results.csv : %d rows (per-sample, with sample column)\n",
+            nrow(all_res)))
+cat(sprintf("LIANA_Visium.csv         : %d rows (consolidated, no duplicates)\n",
+            nrow(consolidated)))
+
+# Filter: Tumour ↔ immune, significant, expressed
+tumour_sig <- all_res |>
+  filter(
+    (source == "Tumour" | target == "Tumour"),
+    !(source == "Tumour" & target == "Tumour"),
+    !is.na(cellphone_pvals), cellphone_pvals < 0.05,
+    !is.na(lr_means), lr_means > 0
+  ) |>
+  filter(
+    sapply(paste(source, target), function(x)
+      any(sapply(immune_types, function(it) grepl(it, x, ignore.case = TRUE))))
+  ) |>
+  mutate(
+    direction = ifelse(source == "Tumour", "Tumour → Immune", "Immune → Tumour"),
+    partner   = ifelse(source == "Tumour", target, source)
+  )
+
+# Aggregate across samples: keep interactions significant in ≥3 samples, per partner
+interaction_counts <- tumour_sig |>
+  group_by(ligand_complex, receptor_complex, direction, partner) |>
+  summarise(
+    n_samples  = n_distinct(sample),
+    mean_lr    = mean(lr_means,        na.rm = TRUE),
+    mean_pval  = mean(cellphone_pvals, na.rm = TRUE),
+    .groups    = "drop"
+  ) |>
+  filter(n_samples >= 3) |>
+  mutate(neg_log10p = -log10(pmax(mean_pval, 1e-3)))
+
+# For each LR pair + direction, keep only the most significant partner (lowest mean_pval)
+interaction_best <- interaction_counts |>
+  group_by(ligand_complex, receptor_complex, direction) |>
+  slice_min(mean_pval, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  # Normalised weighted rank: 40% recurrence, 40% significance, 20% expression
+  mutate(
+    r_samples  = (n_samples  - min(n_samples))  / (max(n_samples)  - min(n_samples)  + 1e-9),
+    r_sig      = (neg_log10p - min(neg_log10p)) / (max(neg_log10p) - min(neg_log10p) + 1e-9),
+    r_expr     = (mean_lr    - min(mean_lr))    / (max(mean_lr)    - min(mean_lr)    + 1e-9),
+    rank_score = 0.4 * r_samples + 0.4 * r_sig + 0.2 * r_expr,
+    lr_label   = paste0(ligand_complex, "  →  ", receptor_complex, " [", partner, "]")
+  )
+
+cat(sprintf("  %d unique Tumour-immune LR pairs (best partner) significant in >=3 samples\n",
+            nrow(interaction_best)))
+
+# Top 20 per direction by composite rank score
+top_rows <- interaction_best |>
+  group_by(direction) |>
+  slice_max(rank_score, n = 20, with_ties = FALSE) |>
+  ungroup()
+
+dir_colours <- c("Tumour → Immune" = "#FF6B35", "Immune → Tumour" = "#4B9CD3")
+
+make_panel <- function(dir) {
+  df <- top_rows |> filter(direction == dir)
+  if (nrow(df) == 0) return(NULL)
+  df <- df |>
+    arrange(desc(rank_score)) |>
+    mutate(lr_label = factor(lr_label, levels = rev(unique(lr_label))))
+
+  ggplot(df, aes(x = mean_lr, y = lr_label, size = neg_log10p, colour = n_samples)) +
+    geom_point(alpha = 0.85) +
+    scale_size_continuous(name = "-log10(p)", range = c(2, 8)) +
+    scale_colour_gradientn(colours = c("#2166AC", "white", "#D6604D"),
+                           name = "N samples") +
+    labs(title = dir, x = "Mean LR expression (across samples)", y = NULL) +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title   = element_text(colour = dir_colours[dir], face = "bold", size = 12),
+      axis.text.y  = element_text(size = 9),
+      legend.position = "right"
+    )
+}
+
+panels <- Filter(Negate(is.null),
+                 lapply(c("Tumour → Immune", "Immune → Tumour"), make_panel))
+
+if (length(panels) > 0) {
+  wrap_plots(panels, ncol = 1) +
+    plot_annotation(
+      title = "Top 20 Ligand-Receptor Interactions (CUP)",
+      theme = theme(plot.title = element_text(size = 14))
+    )
+} else {
+  message("No significant Tumour ↔ immune interactions found in pooled results.")
+}
+
+ggsave(file.path(CPDB_OUT_DIR, "tumour_immune_interactions_consolidated.png"), width = 9, height = 10, dpi = 300)
+```
+
+## Immune checkpoint interactions
+
+Key checkpoint and co-stimulatory LR pairs, mirroring the Xenium analysis.
+Dot size = −log₁₀(p), colour = mean LR expression.
+
+```{r checkpoint-plot, fig.width=14, fig.height=7}
+checkpoint_pairs <- tribble(
+  ~ligand,   ~receptor,
+  "CD274",   "PDCD1",    # PD-L1 → PD-1
+  "LGALS9",  "HAVCR2",   # Galectin-9 → TIM-3
+  "CD80",    "CD28",     # co-stimulatory
+  "CD86",    "CD28",
+  "CD80",    "CTLA4",    # co-inhibitory
+  "CD86",    "CTLA4",
+  "CXCL9",   "CXCR3",   # T cell recruitment
+  "CXCL10",  "CXCR3",
+  "CXCL11",  "CXCR3",
+  "CD274",   "CD80",     # PD-L1 → CD80 reverse signalling
+  "TIGIT",   "PVR",      # TIGIT → PVR
+  "LAG3",    "HLA-DRA",  # LAG3 → MHC-II
+)
+ckp_labels <- paste(checkpoint_pairs$ligand, checkpoint_pairs$receptor, sep = "→")
+
+# Display name formatter: strip any residual prefix, replace _ with space
+fmt_ct <- function(x) {
+  x <- gsub("q05cell_abundance_w_sf_", "", x)
+  gsub("_", " ", x)
+}
+
+ckp_res <- all_res |>
+  mutate(
+    source    = fmt_ct(source),
+    target    = fmt_ct(target),
+    lr_label  = paste(ligand_complex, receptor_complex, sep = " → ")
+  ) |>
+  filter(lr_label %in% gsub("→", " → ", ckp_labels),
+         !is.na(cellphone_pvals), cellphone_pvals < 0.05,
+         !is.na(lr_means), lr_means > 0) |>
+  mutate(
+    pair_label = paste(source, target, sep = " → "),
+    neg_log10p = -log10(pmax(cellphone_pvals, 1e-3))
+  )
+
+if (nrow(ckp_res) > 0) {
+  # Keep top 10 LR pairs by mean expression across all cell-type combos
+  top10_lrs <- ckp_res |>
+    group_by(lr_label) |>
+    summarise(mean_score = mean(lr_means), .groups = "drop") |>
+    slice_max(mean_score, n = 10) |>
+    pull(lr_label)
+
+  ckp_res <- ckp_res |>
+    filter(lr_label %in% top10_lrs) |>
+    arrange(lr_label, desc(lr_means)) |>
+    mutate(
+      lr_label   = factor(lr_label,   levels = rev(sort(unique(lr_label)))),
+      pair_label = factor(pair_label, levels = sort(unique(pair_label)))
+    )
+
+  ggplot(ckp_res, aes(x = pair_label, y = lr_label,
+                      size = neg_log10p, colour = lr_means)) +
+    geom_point(alpha = 0.85) +
+    scale_size_continuous(name = "−log₁₀(p)", range = c(2, 9)) +
+    scale_colour_gradientn(colours = c("#2166AC", "white", "#D6604D"),
+                           name = "Mean expr.") +
+    labs(
+      title    = "Immune checkpoint & co-stimulatory interactions (p < 0.05, all samples)",
+      subtitle = "Top 10 LR pairs · dot size = significance · colour = mean LR expression",
+      x = "Cell-type pair (source → target)", y = "Ligand → Receptor"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(axis.text.x = element_text(angle = 55, hjust = 1, size = 8),
+          axis.text.y = element_text(size = 9))
+} else {
+  message("No significant checkpoint interactions found.")
+}
+```
+
+## Per-sample LR heatmap with ONC/IMI phenotype
+
+ONC/IMI classification loaded from V06 output. If V06 has not yet been run the
+phenotype annotation is omitted and a plain heatmap is shown.
+
+```{r per-sample-heatmap, fig.width=13, fig.height=12}
+# Load V05 ONC/IMI classification (produced by V05_progeny_classification.qmd)
+marta_csv <- file.path(BASE, "metadata", "ONC_IMI_phenotypes.csv")
+if (file.exists(marta_csv)) {
+  pheno_df  <- read.csv(marta_csv, stringsAsFactors = FALSE)
+  pheno_map <- setNames(pheno_df[,2], sub("^CUP-", "", pheno_df[,1]))
+  cat(sprintf("V05 phenotypes loaded: %d samples (%s)\n",
+              nrow(pheno_df), paste(sort(unique(pheno_map)), collapse = " / ")))
+} else {
+  pheno_map <- setNames(rep("Unknown", length(enhanced_list)), names(enhanced_list))
+  message("ONC_IMI_phenotypes.csv not found — run V05 first for phenotype annotation.")
+}
+
+# Build pivot: rows = LR pair, cols = sample, values = mean LR expression (sig. only)
+tumour_per_sample <- all_res |>
+  filter((source == "Tumour" | target == "Tumour"),
+         !(source == "Tumour" & target == "Tumour"),
+         !is.na(cellphone_pvals), cellphone_pvals < 0.05,
+         !is.na(lr_means), lr_means > 0) |>
+  mutate(
+    lr_label  = paste(ligand_complex, receptor_complex, sep = "→"),
+    direction = ifelse(source == "Tumour", "Tumour→Immune", "Immune→Tumour")
+  )
+
+if (nrow(tumour_per_sample) > 0) {
+  # Top 40 LR pairs by mean expression across samples
+  top_lrs <- tumour_per_sample |>
+    group_by(lr_label) |>
+    summarise(mean_lr = mean(lr_means, na.rm = TRUE), .groups = "drop") |>
+    slice_max(mean_lr, n = 40) |>
+    pull(lr_label)
+
+  pivot_mat <- tumour_per_sample |>
+    filter(lr_label %in% top_lrs) |>
+    group_by(lr_label, sample) |>
+    summarise(mean_lr = mean(lr_means, na.rm = TRUE), .groups = "drop") |>
+    pivot_wider(names_from = sample, values_from = mean_lr, values_fill = 0) |>
+    column_to_rownames("lr_label")
+
+  # Order samples by phenotype (ONC first, then IMI, then Unknown)
+  all_samps  <- colnames(pivot_mat)
+  pheno_vec  <- unname(pheno_map[all_samps])
+  pheno_vec[is.na(pheno_vec)] <- "Unknown"
+  samp_order <- all_samps[order(
+    match(pheno_vec, c("ONC", "IMI", "Unknown"))
+  )]
+  pivot_mat <- pivot_mat[, samp_order, drop = FALSE]
+  pheno_ordered <- pheno_vec[order(match(pheno_vec, c("ONC", "IMI", "Unknown")))]
+
+  pheno_colours <- c("ONC" = "#D73027", "IMI" = "#4575B4", "Unknown" = "#888888")
+
+  # Annotation data frame for top colour bar
+  annot_col <- data.frame(Phenotype = pheno_ordered, row.names = samp_order)
+
+  if (requireNamespace("pheatmap", quietly = TRUE)) {
+    pheatmap::pheatmap(
+      pivot_mat,
+      color            = colorRampPalette(c("#2166AC", "white", "#D6604D"))(100),
+      annotation_col   = annot_col,
+      annotation_colors = list(Phenotype = pheno_colours),
+      cluster_cols     = FALSE,   # keep ONC/IMI ordering
+      cluster_rows     = TRUE,
+      fontsize_row     = 7,
+      fontsize_col     = 8,
+      angle_col        = 45,
+      main             = "Top Tumour-Immune LR interactions per sample\n(significant p<0.05 · ONC=red · IMI=blue)",
+      border_color     = NA
+    )
+  } else {
+    # Fallback: ggplot tile heatmap without pheatmap
+    long_mat <- pivot_mat |>
+      tibble::rownames_to_column("lr_label") |>
+      pivot_longer(-lr_label, names_to = "sample", values_to = "mean_lr") |>
+      mutate(
+        sample    = factor(sample, levels = samp_order),
+        phenotype = pheno_map[as.character(sample)],
+        phenotype = replace(phenotype, is.na(phenotype), "Unknown")
+      )
+
+    ggplot(long_mat, aes(x = sample, y = lr_label, fill = mean_lr)) +
+      geom_tile() +
+      scale_fill_gradientn(colours = c("#2166AC", "white", "#D6604D"),
+                           name = "Mean expr.") +
+      geom_tile(data = long_mat |> filter(mean_lr == 0),
+                fill = "grey92", colour = NA) +
+      labs(title = "Top Tumour-Immune LR interactions per sample (p < 0.05)",
+           x = NULL, y = NULL) +
+      theme_classic(base_size = 9) +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7),
+            axis.text.y = element_text(size = 7))
+  }
+} else {
+  message("No significant Tumour-immune interactions to plot.")
+}
+```
+
+## Tumour-involved LR interaction means by ONC/IMI phenotype
+
+Mirrors Xenium Script 17. Tumour-involved pairs (source or target == "Tumour"),
+significant (p < 0.05) in ≥ 3 samples. Wilcoxon rank-sum test (ONC vs IMI)
+with rank-biserial r as the effect size. Two views: a per-sample heatmap (top 40 pairs
+by variance + differential expression) and boxplots of the top differentiating pairs.
+
+```{r lr-onc-imi-compute}
+# Reuse all_res and pheno_map already loaded above
+
+# Filter to Tumour-involved interactions
+liana_tumor <- all_res |>
+  filter((source == "Tumour" | target == "Tumour"),
+         !(source == "Tumour" & target == "Tumour")) |>
+  mutate(
+    lr_pair   = paste0(ligand_complex, " → ", receptor_complex,
+                       " (", source, "→", target, ")"),
+    direction = if_else(source == "Tumour", "Tumour → Immune", "Immune → Tumour")
+  )
+
+# Mean lr_means per sample per LR pair; keep pairs significant in ≥3 samples
+liana_summary <- liana_tumor |>
+  group_by(sample, lr_pair, direction) |>
+  summarise(lr_mean  = mean(lr_means,       na.rm = TRUE),
+            min_pval = min(cellphone_pvals,  na.rm = TRUE),
+            .groups  = "drop")
+
+sig_pairs <- liana_summary |>
+  filter(min_pval < 0.05) |>
+  count(lr_pair) |>
+  filter(n >= 3) |>
+  pull(lr_pair)
+
+cat(sprintf("Tumour-involved LR pairs significant in ≥3 samples: %d\n", length(sig_pairs)))
+
+# Wide matrix: samples × LR pairs
+liana_wide <- liana_summary |>
+  filter(lr_pair %in% sig_pairs) |>
+  select(sample, lr_pair, lr_mean) |>
+  pivot_wider(names_from = lr_pair, values_from = lr_mean, values_fill = 0) |>
+  column_to_rownames("sample")
+
+# Fill in any samples absent from the results
+all_samps_lr <- names(pheno_map)[pheno_map %in% c("ONC", "IMI")]
+missing_samps <- setdiff(all_samps_lr, rownames(liana_wide))
+if (length(missing_samps) > 0) {
+  zero_mat <- matrix(0, nrow = length(missing_samps), ncol = ncol(liana_wide),
+                     dimnames = list(missing_samps, colnames(liana_wide)))
+  liana_wide <- rbind(liana_wide, zero_mat)
+}
+
+common_lr  <- intersect(rownames(liana_wide), all_samps_lr)
+pheno_lr   <- pheno_map[common_lr]
+onc_samps  <- names(pheno_lr)[pheno_lr == "ONC"]
+imi_samps  <- names(pheno_lr)[pheno_lr == "IMI"]
+samp_order <- c(sort(onc_samps), sort(imi_samps))
+
+cat(sprintf("LR matrix: %d samples × %d pairs  (ONC=%d, IMI=%d)\n",
+            length(common_lr), ncol(liana_wide), length(onc_samps), length(imi_samps)))
+
+# Rank-biserial r (effect size, matches Script 17b)
+rank_bis_lr <- function(x, y) {
+  n1 <- sum(!is.na(x)); n2 <- sum(!is.na(y))
+  if (n1 < 2 || n2 < 2) return(NA_real_)
+  as.numeric(1 - (2 * suppressWarnings(wilcox.test(x, y, exact = FALSE))$statistic) /
+               (n1 * n2))
+}
+
+liana_stats <- bind_rows(lapply(colnames(liana_wide), function(lr) {
+  onc_v <- liana_wide[onc_samps, lr]
+  imi_v <- liana_wide[imi_samps, lr]
+  p     <- suppressWarnings(tryCatch(wilcox.test(onc_v, imi_v, exact = FALSE)$p.value,
+                                     error = function(e) NA_real_))
+  tibble(feature      = lr,
+         median_ONC   = median(onc_v, na.rm = TRUE),
+         median_IMI   = median(imi_v, na.rm = TRUE),
+         rank_biserial = rank_bis_lr(onc_v, imi_v),
+         p_value      = p)
+})) |>
+  mutate(p_adj = p.adjust(p_value, method = "BH")) |>
+  arrange(p_value)
+
+# Attach direction label for per-direction plots
+lr_dir_map  <- liana_summary |> distinct(lr_pair, direction)
+liana_stats <- liana_stats |>
+  left_join(lr_dir_map, by = c("feature" = "lr_pair"))
+
+cat("Top 8 differentiating LR pairs:\n")
+print(liana_stats |> select(feature, median_ONC, median_IMI, rank_biserial, p_value) |>
+        slice_head(n = 8), n = 8)
+
+
+```
+
+```{r lr-imi-to-tumour, fig.width = 16, fig.height = 7}
+if (ncol(liana_wide) > 0 && "direction" %in% colnames(liana_stats)) {
+  dir_label <- "Immune → Tumour"
+  dir_stats_pool <- liana_stats |>
+    filter(direction == dir_label, !is.na(rank_biserial))
+
+  # Top 5 ONC-enriched + top 5 IMI-enriched; significant pairs (p<0.05) prioritised
+  # Each group ordered by desc(abs(rank_biserial)): ONC high→low, IMI most-negative→least
+  dir_stats_it <- bind_rows(
+    dir_stats_pool |> filter(rank_biserial >  0) |>
+      arrange(p_value < 0.05),
+    dir_stats_pool |> filter(rank_biserial <= 0) |>
+      arrange(p_value < 0.05)
+  )
+
+  dir_stats_it <- dir_stats_it %>%
+    filter(p_value < 0.05) %>%
+    arrange(p_value)
+
+  # Replace "Tumour" with "Tumor" before building valid_pairs_it so all downstream objects are consistent
+  dir_stats_it$feature <- gsub("Tumour", "Tumor", dir_stats_it$feature)
+  colnames(liana_wide) <- gsub("Tumour", "Tumor", colnames(liana_wide))
+
+  valid_pairs_it <- intersect(dir_stats_it$feature, colnames(liana_wide))
+
+  if (length(valid_pairs_it) > 0) {
+    long_lr_i <- liana_wide[common_lr, valid_pairs_it, drop = FALSE] |>
+      as.data.frame() |>
+      rownames_to_column("sample") |>
+      pivot_longer(-sample, names_to = "lr_pair", values_to = "lr_mean") |>
+      mutate(
+        phenotype = factor(pheno_lr[sample], levels = c("ONC", "IMI")),
+        strip     = factor(lr_pair, levels = valid_pairs_it)
+      )
+
+    eff_i <- dir_stats_it |>
+      filter(feature %in% valid_pairs_it) |>
+      mutate(
+        strip     = factor(feature, levels = valid_pairs_it),
+        eff_label = sprintf("r=%.2f\np=%.3f", rank_biserial, p_value)
+      )
+
+    # Lollipop
+    # Lollipop — each group desc(abs(r)): IMI most-negative at top, ONC highest at top
+
+    lol_i <- dir_stats_it |>
+      filter(feature %in% valid_pairs_it
+    ) |> mutate(
+        feature     = factor(feature, levels = unique(feature)),
+        neg_log10_p = pmin(-log10(p_value + 1e-10), 5),
+        significant = !is.na(p_value) & p_value < 0.05,
+        enriched_in = factor(ifelse(rank_biserial > 0, "IMI", "ONC"), levels = c("ONC", "IMI"))
+      ) %>%
+        slice_head(n = 10)
+
+    lol_i <- lol_i |>
+    mutate(feature = factor(feature, levels = rev(levels(feature))))
+
+    print(
+      ggplot(lol_i, aes(x = rank_biserial, y = feature, colour = enriched_in)) +
+        geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+        geom_segment(aes(x = 0, xend = rank_biserial, yend = feature),
+                     linewidth = 0.9, alpha = 0.75) +
+        geom_point(aes(size = neg_log10_p, shape = significant)) +
+        facet_grid(enriched_in ~ ., scales = "free_y", space = "free_y") +
+        scale_colour_manual(values = c("ONC" = "#D73027", "IMI" = "#4575B4"),
+                            name = "Enriched in") +
+        scale_shape_manual(values = c("TRUE" = 19, "FALSE" = 1),
+                           labels = c("TRUE" = "p < 0.05", "FALSE" = "ns"),
+                           name = "Significance") +
+        scale_size_continuous(range = c(2.5, 8), name = expression(-log[10]~"p")) +
+        scale_x_continuous(limits = c(-1, 1), expand = expansion(add = c(0.05, 0.05))) +
+        labs(title    = "Top 10 LRIs by ONC/IMI (Immune -> Tumor)",
+             subtitle = "r > 0 = higher in IMI",
+             x = "Rank-biserial r", y = NULL) +
+        theme_bw(base_size = 11) +
+        theme(plot.title         = element_text(face = "bold"),
+              legend.position    = "right",
+              strip.text.y       = element_text(face = "bold", angle = 0),
+              axis.text.y        = element_text(size = 10),
+              panel.grid.major.y = element_line(colour = "grey92"),
+              panel.spacing      = unit(0.8, "lines"))
+    )
+    ggsave(file.path(CPDB_OUT_DIR, "immune_tumour_lr_lollipop.png"), width = 8, height = 5, dpi = 300)
+  }
+}
+```
+
+```{r lr-tumour-to-immune, fig.width = 16, fig.height = 7}
+if (ncol(liana_wide) > 0 && "direction" %in% colnames(liana_stats)) {
+  dir_label <- "Tumour → Immune"
+  dir_stats_pool <- liana_stats |>
+    filter(direction == dir_label, !is.na(rank_biserial))
+
+  # Top 5 ONC-enriched + top 5 IMI-enriched; significant pairs (p<0.05) prioritised
+  # Each group ordered by desc(abs(rank_biserial)): ONC high→low, IMI most-negative→least
+  dir_stats_ti <- bind_rows(
+    dir_stats_pool |> filter(rank_biserial >  0) |>
+      arrange(p_value < 0.05),
+    dir_stats_pool |> filter(rank_biserial <= 0) |>
+      arrange(p_value < 0.05)
+  )
+
+  dir_stats_ti <- dir_stats_ti %>%
+    filter(p_value < 0.05) %>%
+    arrange(p_value) %>%
+    slice_head(n = 10)
+
+  # Replace "Tumour" with "Tumor" before building valid_pairs_ti so all downstream objects are consistent
+  dir_stats_ti$feature <- gsub("Tumour", "Tumor", dir_stats_ti$feature)
+  colnames(liana_wide) <- gsub("Tumour", "Tumor", colnames(liana_wide))
+
+  valid_pairs_ti <- intersect(dir_stats_ti$feature, colnames(liana_wide))
+
+    # Lollipop
+    # Lollipop — each group desc(abs(r)): IMI most-negative at top, ONC highest at top
+    lol_t <- bind_rows(
+      dir_stats_ti |> filter(feature %in% valid_pairs_ti, rank_biserial <= 0) |>
+        arrange(p_value),
+      dir_stats_ti |> filter(feature %in% valid_pairs_ti, rank_biserial >  0) |>
+        arrange(p_value)
+    ) |> mutate(
+        feature     = factor(feature, levels = unique(feature)),
+        neg_log10_p = pmin(-log10(p_value + 1e-10), 5),
+        significant = !is.na(p_value) & p_value < 0.05,
+        enriched_in = factor(ifelse(rank_biserial > 0, "IMI", "ONC"), levels = c("ONC", "IMI"))
+      )
+
+  lol_t <- lol_t |>
+  mutate(feature = factor(feature, levels = rev(levels(feature))))
+
+    print(
+      ggplot(lol_t, aes(x = rank_biserial, y = feature, colour = enriched_in)) +
+        geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+        geom_segment(aes(x = 0, xend = rank_biserial, yend = feature),
+                     linewidth = 0.9, alpha = 0.75) +
+        geom_point(aes(size = neg_log10_p, shape = significant)) +
+        facet_grid(enriched_in ~ ., scales = "free_y", space = "free_y") +
+        scale_colour_manual(values = c("ONC" = "#D73027", "IMI" = "#4575B4"),
+                            name = "Enriched in") +
+        scale_shape_manual(values = c("TRUE" = 19, "FALSE" = 1),
+                           labels = c("TRUE" = "p < 0.05", "FALSE" = "ns"),
+                           name = "Significance") +
+        scale_size_continuous(range = c(2.5, 8), name = expression(-log[10]~"p")) +
+        scale_x_continuous(limits = c(-1, 1), expand = expansion(add = c(0.05, 0.05))) +
+        labs(title    = "Top 10 LRIs by ONC/IMI (Tumor -> Immune )",
+             subtitle = "r > 0 = higher in IMI",
+             x = "Rank-biserial r", y = NULL) +
+        theme_bw(base_size = 11) +
+        theme(plot.title         = element_text(face = "bold"),
+              legend.position    = "right",
+              strip.text.y       = element_text(face = "bold", angle = 0),
+              axis.text.y        = element_text(size = 10),
+              panel.grid.major.y = element_line(colour = "grey92"),
+              panel.spacing      = unit(0.8, "lines"))
+    )
+    ggsave(file.path(CPDB_OUT_DIR, "tumour_immune_lr_lollipop.png"), width = 8, height = 5, dpi = 300)
+  }
+
+```
+
+```{r}
+
+# Plot with tumour -> immune and immune -> tumour in same plot
+if (ncol(liana_wide) > 0 && "direction" %in% colnames(liana_stats)) {
+  dir_stats_pool <- liana_stats |>
+    filter(!is.na(rank_biserial))
+
+```
+
+```{r lr-phenotype-export}
+if (exists("liana_stats") && exists("liana_wide")) {
+  library(openxlsx)
+
+  # Per-pair sample counts (n samples with lr_mean > 0 per phenotype)
+  n_counts <- bind_rows(lapply(colnames(liana_wide), function(lr) {
+    tibble(
+      feature = lr,
+      n_ONC   = sum(liana_wide[onc_samps, lr] > 0, na.rm = TRUE),
+      n_IMI   = sum(liana_wide[imi_samps, lr] > 0, na.rm = TRUE)
+    )
+  }))
+
+  make_lr_sheet <- function(direction_label, enrich_side) {
+    liana_stats |>
+      filter(direction == direction_label, !is.na(rank_biserial),
+             if (enrich_side == "ONC") rank_biserial > 0 else rank_biserial <= 0) |>
+      left_join(n_counts, by = "feature") |>
+      (\(d) if (enrich_side == "ONC") arrange(d, desc(rank_biserial))
+            else arrange(d, rank_biserial))() |>
+      select(lr_pair = feature, direction, rank_biserial, p_value,
+             median_ONC, median_IMI, n_ONC, n_IMI)
+  }
+
+  wb <- createWorkbook()
+
+  addWorksheet(wb, "IT_ONC_enriched")
+  writeData(wb, "IT_ONC_enriched", make_lr_sheet("Immune → Tumour", "ONC"))
+
+  addWorksheet(wb, "IT_IMI_enriched")
+  writeData(wb, "IT_IMI_enriched", make_lr_sheet("Immune → Tumour", "IMI"))
+
+  addWorksheet(wb, "TI_ONC_enriched")
+  writeData(wb, "TI_ONC_enriched", make_lr_sheet("Tumour → Immune", "ONC"))
+
+  addWorksheet(wb, "TI_IMI_enriched")
+  writeData(wb, "TI_IMI_enriched", make_lr_sheet("Tumour → Immune", "IMI"))
+
+  # Consolidated dot-plot data (same order as plot: rank_score descending)
+  if (exists("top_rows")) {
+    consol_cols <- c("lr_label", "ligand_complex", "receptor_complex", "partner",
+                     "direction", "n_samples", "mean_lr", "mean_pval",
+                     "neg_log10p", "rank_score")
+
+    ti_consol <- interaction_best |>
+      filter(direction == "Tumour → Immune") |>
+      arrange(desc(rank_score)) |>
+      select(any_of(consol_cols))
+
+    it_consol <- interaction_best |>
+      filter(direction == "Immune → Tumour") |>
+      arrange(desc(rank_score)) |>
+      select(any_of(consol_cols))
+
+    addWorksheet(wb, "Consolidated_TI")
+    writeData(wb, "Consolidated_TI", ti_consol)
+
+    addWorksheet(wb, "Consolidated_IT")
+    writeData(wb, "Consolidated_IT", it_consol)
+  }
+
+  saveWorkbook(wb, file.path(CPDB_OUT_DIR, "LR_phenotype_data.xlsx"), overwrite = TRUE)
+  cat("Exported LR_phenotype_data.xlsx\n")
+}
+```
+
+## Spatial LR interaction maps
+
+Per-sub-spot interaction potential for three selected LR pairs. Score = **ligand logcounts ×
+receptor logcounts** (for complexes: ligand × min(subunit1, subunit2) — follows CellPhoneDB
+convention). All BayesSpace sub-spots from the full enhanced SCE are plotted; colour encodes
+the joint expression product. Samples are ordered ONC first (left columns), IMI second
+(right columns).
+
+```{r lr-spatial-compute}
+# Compute per-sub-spot LR interaction score for selected pairs
+target_lr <- list(
+  "ANXA1 → FPR3"         = list(lig = "ANXA1", rec = c("FPR3")),
+  "COL1A2 → ITGA2:ITGB1"  = list(lig = "COL1A2", rec = c("ITGA2", "ITGB1")),
+  "FN1 → ITGA3:ITGB1"          = list(lig = "FN1", rec = c("ITGA3", "ITGB1"))
+)
+
+onc_order <- sort(names(pheno_map)[pheno_map == "ONC"])
+imi_order <- sort(names(pheno_map)[pheno_map == "IMI"])
+samp_order_sp <- c(onc_order, imi_order)
+
+spatial_scores <- lapply(names(enhanced_list), function(s) {
+  sce <- enhanced_list[[s]]
+  lc  <- assay(sce, "logcounts")
+  cd  <- as.data.frame(colData(sce))
+  cd$sample    <- s
+  cd$phenotype <- pheno_map[s]
+
+  for (nm in names(target_lr)) {
+    lr <- target_lr[[nm]]
+    if (!lr$lig %in% rownames(lc) || !all(lr$rec %in% rownames(lc))) {
+      cd[[nm]] <- NA_real_; next
+    }
+    lig_v <- as.numeric(lc[lr$lig, ])
+    rec_v <- if (length(lr$rec) == 1) {
+      as.numeric(lc[lr$rec, ])
+    } else {
+      apply(lc[lr$rec, , drop = FALSE], 2, min)
+    }
+    cd[[nm]] <- lig_v * rec_v
+  }
+  cd[, c("array_col", "array_row",
+         "sample", "phenotype", names(target_lr))]
+}) |>
+  bind_rows()
+
+cat(sprintf("Spatial score data: %d sub-spots across %d samples\n",
+            nrow(spatial_scores), length(unique(spatial_scores$sample))))
+```
+
+```{r lr-spatial-panel, fig.width=11, fig.height=15}
+library(patchwork)
+library(ggnewscale)
+
+# Fixed sample × LR pair assignments
+panel_spec <- list(
+  list(samp = "373",  lr = "ANXA1 → FPR3"),
+  list(samp = "271",   lr = "COL1A2 → ITGA2:ITGB1"),
+  list(samp = "372",   lr = "FN1 → ITGA3:ITGB1")
+)
+
+black_theme <- theme_void(base_size = 10) +
+  theme(
+    plot.background   = element_rect(fill = "black", colour = NA),
+    panel.background  = element_rect(fill = "black", colour = NA),
+    legend.background = element_rect(fill = "black", colour = NA),
+    legend.position   = "bottom",
+    legend.key.height = unit(0.3, "cm"),
+    legend.key.width  = unit(0.7, "cm"),
+    legend.text       = element_text(colour = "white", size = 8),
+    legend.title      = element_text(colour = "white", size = 8.5, face = "bold"),
+    plot.title        = element_text(face = "bold", size = 11, hjust = 0.5,
+                                     colour = "white"),
+    plot.subtitle     = element_text(size = 8.5, hjust = 0.5, colour = "grey55")
+  )
+
+make_lr_row <- function(samp, pair_name) {
+  sce <- enhanced_list[[samp]]
+  lc  <- assay(sce, "logcounts")
+  cd  <- as.data.frame(colData(sce))
+
+  lr_def    <- target_lr[[pair_name]]
+  rec_label <- paste(lr_def$rec, collapse = ":")
+
+  lig_v <- if (lr_def$lig %in% rownames(lc)) as.numeric(lc[lr_def$lig, ])
+           else rep(NA_real_, ncol(lc))
+  rec_v <- if (all(lr_def$rec %in% rownames(lc))) {
+    if (length(lr_def$rec) == 1) as.numeric(lc[lr_def$rec, ])
+    else apply(lc[lr_def$rec, , drop = FALSE], 2, min)
+  } else rep(NA_real_, ncol(lc))
+
+  df <- data.frame(
+    x    = cd$array_col,
+    y    = -cd$array_row,
+    comp = cd$compartment,
+    lig  = lig_v,
+    rec  = rec_v
+  )
+
+  tumour_df <- df |> filter(comp == "Tumour")
+  stroma_df <- df |> filter(comp == "Stroma")
+
+  lig_cap <- quantile(tumour_df$lig[tumour_df$lig > 0], 0.99, na.rm = TRUE)
+  rec_cap <- quantile(stroma_df$rec[stroma_df$rec  > 0], 0.99, na.rm = TRUE)
+  tumour_df$lig_c <- pmin(tumour_df$lig, lig_cap)
+  stroma_df$rec_c <- pmin(stroma_df$rec, rec_cap)
+
+  # ── Left: Tumour/Stroma compartment (black bg) ────────────────────────────────
+  p_comp <- ggplot(df, aes(x, y, colour = comp)) +
+    geom_point(size = 0.4, alpha = 0.8, stroke = 0) +
+    coord_fixed() +
+    scale_colour_manual(
+      values = c("Tumour" = "#E74C3C", "Stroma" = "#3498DB"),
+      name   = NULL
+    ) +
+    labs(subtitle = "Tumour / Stroma") +
+    labs(subtitle = "Tumour / Stroma", y = samp) +
+    black_theme +
+    theme(axis.title.y = element_text(size = 9, face = "bold", colour = "white",
+                                   angle = 90, margin = margin(r = 5))) +
+    guides(colour = guide_legend(override.aes = list(size = 3)))
+
+  # ── Right: directed interaction — ligand in Tumour, receptor in Stroma ────────
+  p_lr <- ggplot() +
+    # Tumour sub-spots: ligand expression (warm scale)
+    geom_point(data = tumour_df,
+               aes(x, y, colour = lig_c),
+               size = 0.4, alpha = 0.7, stroke = 0) +
+    scale_colour_gradientn(
+      colours  = c("grey20", "#FC8D59", "#D73027"),
+      name     = lr_def$lig,
+      na.value = "grey15"
+    ) +
+    new_scale_colour() +
+    # Stroma sub-spots: receptor expression (cool scale)
+    geom_point(data = stroma_df,
+               aes(x, y, colour = rec_c),
+               size = 0.4, alpha = 0.9, stroke = 0) +
+    scale_colour_gradientn(
+      colours  = c("grey20", "#91BFDB", "#2171B5"),
+      name     = rec_label,
+      na.value = "grey15"
+    ) +
+    coord_fixed() +
+    labs(subtitle = pair_name) +
+    black_theme
+
+  p_comp + p_lr
+}
+
+rows <- lapply(panel_spec, function(sp) make_lr_row(sp$samp, sp$lr))
+wrap_plots(rows, ncol = 1, heights = c(1, 1, 1)) +
+  plot_annotation(
+    title = "Ligand - Receptor Spatial Interaction Maps (CUP)",
+    theme = theme(plot.title = element_text(size = 12), plot.background = element_rect(fill = "black"),
+    title = element_text(colour = "white", face = "bold")
+  ))
+
+ggsave(file.path(CPDB_DIR, "LR_Spatial_Maps.png"), width = 10, height = 12, dpi = 300)
+
+```
+
+## Session info
+
+```{r session}
+sessionInfo()
+```

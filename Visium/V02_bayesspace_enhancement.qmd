@@ -1,0 +1,445 @@
+---
+title: "V02 — BayesSpace Spatial Enhancement"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    self-contained: true
+    fig-width: 14
+    fig-height: 8
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+Runs BayesSpace per-sample to (1) identify spatially coherent tissue domains (`spatialCluster`)
+and (2) generate enhanced sub-spot pseudo-cells (`spatialEnhance`).
+
+**Resolution**: `nsubspot.per.edge = 4` subdivides each Visium spot (~55 µm, ~100 µm pitch)
+into ~13 sub-spots, giving an effective sub-spot spacing of ~25 µm — sufficient to resolve the
+<30 µm Tumour niche zone used in V06.
+
+**Parallelisation**: samples are processed in parallel with `mclapply`. BayesSpace's MCMC
+(Gibbs sampling) runs on CPU only — no GPU path exists in the R package. The GPU can be used
+in V03 for CancerFinder3's PyTorch inference instead. Remaining cores are allocated to
+OpenBLAS (BLAS threads) to accelerate the PCA step within each worker.
+
+**Runtime**: with `N_PARALLEL = 5` and `nrep = 10 000`, expect ~60–90 min total (all 20
+samples). Per-sample RDS caches are written to `bayesspace_cache/`; re-running skips
+completed samples.
+
+**Input**: `visium_seurat_list.rds`
+**Output**: `visium_enhanced_sce_list.rds` + `bayesspace_cache/<sample>_enhanced.rds`
+
+```{r setup}
+library(Seurat)
+library(BayesSpace)
+library(SingleCellExperiment)
+library(Matrix)
+library(parallel)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(scales)
+
+BASE      <- "."
+CACHE_DIR <- file.path(BASE, "bayesspace_cache")
+OUT_RDS   <- file.path(BASE, "visium_enhanced_sce_list.rds")
+dir.create(CACHE_DIR, showWarnings = FALSE)
+
+# ── Parallelisation config ──────────────────────────────────────────────────
+# Run up to 5 samples in parallel (reduced for USB drive I/O; 20 samples = two passes)
+# 24 usable cores split across workers:
+#   BLAS_PER_WORKER  = 2  (OpenBLAS threads for PCA in spatialPreprocess)
+#   ENHANCE_CORES    = 2  (cores argument to spatialEnhance, parallel sub-chains)
+#   → 10 × 2 = 20 cores busy during enhancement; headroom for OS
+N_PARALLEL           <- 5L
+TOTAL_CORES          <- as.integer(parallel::detectCores() - 2L)
+BLAS_PER_WORKER      <- 2L
+ENHANCE_CORES        <- 2L
+
+# ── BayesSpace config ───────────────────────────────────────────────────────
+NSUBSPOT_PER_EDGE <- 4L   # ~13 sub-spots/spot, ~25 µm effective spacing
+NREP_CLUSTER      <- 10000L
+NREP_ENHANCE      <- 10000L
+BURN_IN           <- 1000L
+
+seurat_list <- readRDS(file.path(BASE, "results", "01_qc", "visium_seurat_list.rds"))
+
+SAMPLES_SKIP <- c()   # no samples to skip
+if (length(SAMPLES_SKIP) > 0)
+  seurat_list <- seurat_list[setdiff(names(seurat_list), SAMPLES_SKIP)]
+```
+
+## Helper functions
+
+```{r helpers}
+make_bayesspace_sce <- function(seurat_obj, sample_name) {
+  counts_mat <- GetAssayData(seurat_obj, assay = "Spatial", layer = "counts")
+  tp_path <- file.path(BASE, sample_name, "spatial", "tissue_positions.csv")
+  tp <- read.csv(tp_path, row.names = 1)
+  cells <- intersect(colnames(seurat_obj), rownames(tp))
+  tp <- tp[cells, ]
+
+  sce <- SingleCellExperiment(
+    assays  = list(counts = counts_mat[, cells, drop = FALSE]),
+    colData = DataFrame(
+      row.names          = cells,
+      spot_id            = cells,
+      array_row          = tp$array_row,
+      array_col          = tp$array_col,
+      pxl_row_in_fullres = tp$pxl_row_in_fullres,
+      pxl_col_in_fullres = tp$pxl_col_in_fullres
+    )
+  )
+  sce
+}
+```
+
+## Run BayesSpace — parallel across samples
+
+Each sample is processed in an independent forked worker. Libraries and the full R environment
+are inherited via `fork()` — no re-loading needed. BLAS threads are set per worker to use the
+remaining cores for the PCA step in `spatialPreprocess`.
+
+```{r run-bayesspace}
+process_sample <- function(s) {
+  cache_file <- file.path(CACHE_DIR, paste0(s, "_enhanced.rds"))
+  fail_file  <- file.path(CACHE_DIR, paste0(s, "_failed.flag"))
+
+  if (file.exists(cache_file)) {
+    message(sprintf("[%s] cache hit — skipping", s))
+    return(invisible(NULL))
+  }
+
+  # Top-level error guard: any failure writes a .flag and returns NULL (no worker crash)
+  tryCatch({
+    if (requireNamespace("RhpcBLASctl", quietly = TRUE))
+      RhpcBLASctl::blas_set_num_threads(BLAS_PER_WORKER)
+
+    message(sprintf("[%s] starting (pid %d)", s, Sys.getpid()))
+    t0 <- proc.time()
+
+    sce <- make_bayesspace_sce(seurat_list[[s]], s)
+    message(sprintf("[%s] %d spots × %d genes", s, ncol(sce), nrow(sce)))
+
+    set.seed(42)
+    sce <- spatialPreprocess(sce, platform = "Visium",
+                             n.PCs = 15, n.HVGs = 2000,
+                             log.normalize = TRUE, skip.PCA = FALSE)
+
+    set.seed(42)
+    sce       <- qTune(sce, qs = 4:8, platform = "Visium", nrep = 1000)
+    q_logliks <- attr(sce, "q.logliks")
+    q_opt     <- q_logliks$q[which.max(q_logliks$loglik)]
+    message(sprintf("[%s] optimal q = %d  (log-liks: %s)",
+                    s, q_opt,
+                    paste(sprintf("q%d=%.0f", q_logliks$q, q_logliks$loglik), collapse = ", ")))
+
+    set.seed(42)
+    sce <- spatialCluster(sce, q = q_opt, platform = "Visium",
+                          nrep = NREP_CLUSTER, burn.in = BURN_IN)
+
+    # Try nsubspots.per.edge=4, fall back to 3
+    set.seed(42)
+    sce_enh <- tryCatch(
+      spatialEnhance(sce, q = q_opt, platform = "Visium",
+                     nrep               = NREP_ENHANCE,
+                     burn.in            = BURN_IN,
+                     nsubspots.per.edge = NSUBSPOT_PER_EDGE,
+                     cores              = ENHANCE_CORES,
+                     save.chain         = FALSE),
+      error = function(e) {
+        message(sprintf("[%s] nsubspots.per.edge=%d failed (%s) — retrying with 3",
+                        s, NSUBSPOT_PER_EDGE, conditionMessage(e)))
+        set.seed(42)
+        spatialEnhance(sce, q = q_opt, platform = "Visium",
+                       nrep               = NREP_ENHANCE,
+                       burn.in            = BURN_IN,
+                       nsubspots.per.edge = 3L,
+                       cores              = ENHANCE_CORES,
+                       save.chain         = FALSE)
+      }
+    )
+
+    parent_idx <- colData(sce_enh)$spot.idx
+    colData(sce_enh)$pxl_row_in_fullres  <- colData(sce)$pxl_row_in_fullres[parent_idx]
+    colData(sce_enh)$pxl_col_in_fullres  <- colData(sce)$pxl_col_in_fullres[parent_idx]
+    colData(sce_enh)$original_spot_id    <- colnames(sce)[parent_idx]
+    colData(sce_enh)$parent_array_row    <- colData(sce)$array_row[parent_idx]
+    colData(sce_enh)$parent_array_col    <- colData(sce)$array_col[parent_idx]
+    colData(sce_enh)$sample              <- s
+
+    elapsed <- round((proc.time() - t0)[["elapsed"]] / 60, 1)
+    message(sprintf("[%s] done — %d sub-spots in %.1f min; saving ...", s, ncol(sce_enh), elapsed))
+    saveRDS(sce_enh, cache_file)
+
+  }, error = function(e) {
+    msg <- conditionMessage(e)
+    message(sprintf("[%s] FAILED — %s", s, msg))
+    writeLines(msg, fail_file)   # persist failure reason for inspection
+  })
+
+  invisible(NULL)
+}
+
+# Run N_PARALLEL samples simultaneously
+results <- mclapply(names(seurat_list), process_sample,
+                    mc.cores = N_PARALLEL, mc.preschedule = FALSE)
+names(results) <- names(seurat_list)
+
+# Report failures (warn, do not stop — failed samples are skipped downstream)
+fail_flags <- list.files(CACHE_DIR, pattern = "_failed\\.flag$", full.names = TRUE)
+if (length(fail_flags) > 0) {
+  failed_names <- sub("_failed\\.flag$", "", basename(fail_flags))
+  for (fn in fail_flags) {
+    reason <- tryCatch(readLines(fn, warn = FALSE), error = function(e) "unknown error")
+    warning(sprintf("BayesSpace SKIPPED %s: %s", sub("_failed\\.flag$", "", basename(fn)),
+                    paste(reason, collapse = " ")))
+  }
+  cat(sprintf("\n> **%d sample(s) skipped** (BayesSpace failed): %s\n\n",
+              length(failed_names), paste(failed_names, collapse = ", ")))
+} else {
+  cat("All samples complete.\n")
+}
+```
+
+## Load enhanced SCEs from cache
+
+`spatialEnhance` returns sub-spot positions and cluster labels only (no assays). We map
+parent-spot raw counts → log-normalise → assign to each sub-spot using the stored
+`original_spot_id` field, giving downstream scripts a `logcounts` assay to work with.
+
+```{r load-all}
+enhanced_list <- lapply(names(seurat_list), function(s) {
+  f <- file.path(CACHE_DIR, paste0(s, "_enhanced.rds"))
+  if (!file.exists(f)) {
+    message(sprintf("[%s] no cache — skipped (BayesSpace failed or not yet run)", s))
+    return(NULL)
+  }
+  sce_enh <- readRDS(f)
+
+  # spatialEnhance produces no assay data; populate logcounts from parent-spot raw counts.
+  raw        <- GetAssayData(seurat_list[[s]], assay = "Spatial", layer = "counts")
+  parent_ids <- colData(sce_enh)$original_spot_id   # parent barcode per sub-spot
+
+  # Guard: replace any NA parent_ids (edge case for last spot's sub-spots)
+  na_mask <- is.na(parent_ids)
+  if (any(na_mask)) {
+    parent_ids[na_mask] <- colnames(seurat_list[[s]])[1]
+    message(sprintf("[%s] %d sub-spots had NA parent_id — assigned to first spot", s, sum(na_mask)))
+  }
+
+  # Log-normalise raw counts for the selected parents (columns = one entry per sub-spot)
+  parent_raw  <- raw[, parent_ids, drop = FALSE]
+  lib_sizes   <- Matrix::colSums(parent_raw)
+  lib_sizes[lib_sizes == 0] <- 1L
+  parent_lc   <- log1p(Matrix::t(Matrix::t(parent_raw) / lib_sizes) * 10000)
+  colnames(parent_lc) <- colnames(sce_enh)
+
+  assay(sce_enh, "logcounts") <- parent_lc
+  sce_enh
+})
+names(enhanced_list) <- names(seurat_list)
+enhanced_list <- Filter(Negate(is.null), enhanced_list)
+cat(sprintf("Loaded %d / %d enhanced SCEs\n", length(enhanced_list), length(seurat_list)))
+```
+
+## Enhanced sub-spot QC
+
+Sub-spots inherit parent expression (BayesSpace `spatialEnhance` does not deconvolve
+expression — positions and cluster labels are enhanced). QC is therefore reported at both
+levels: **parent spots** (true observation units for expression) and **sub-spots** (spatial
+resolution units).
+
+```{r qc-build}
+qc_df <- lapply(names(enhanced_list), function(s) {
+  sce_enh <- enhanced_list[[s]]
+  lc      <- assay(sce_enh, "logcounts")   # genes × sub-spots
+
+  # ── Sub-spot level ──────────────────────────────────────────────────────────
+  subspot_counts  <- Matrix::colSums(lc)                          # total logcount sum
+  subspot_genes   <- Matrix::colSums(lc > 0)                      # detected genes
+  subspot_zeros   <- 1 - subspot_genes / nrow(lc)                 # sparsity fraction
+
+  # ── Parent-spot level (from seurat raw counts) ─────────────────────────────
+  meta        <- seurat_list[[s]]@meta.data
+  parent_ids  <- colData(sce_enh)$original_spot_id
+  n_subspots  <- as.integer(table(parent_ids)[unique(parent_ids)])
+
+  # Align parent metadata to the unique parent order
+  parent_meta <- meta[unique(parent_ids), , drop = FALSE]
+
+  data.frame(
+    sample         = s,
+    # sub-spot rows
+    subspot_id     = colnames(sce_enh),
+    subspot_counts = subspot_counts,
+    subspot_genes  = subspot_genes,
+    subspot_zeros  = subspot_zeros,
+    parent_id      = parent_ids,
+    # parent info broadcast to sub-spots (for joined plots)
+    parent_umi     = meta[parent_ids, "nCount_Spatial"],
+    parent_genes   = meta[parent_ids, "nFeature_Spatial"],
+    n_subspots_for_parent = as.integer(table(parent_ids)[parent_ids])
+  )
+}) |> bind_rows()
+```
+
+### Sub-spots per parent spot
+
+```{r qc-subspots-per-parent, fig.height=4}
+# One row per unique parent spot
+parent_df <- qc_df[!duplicated(paste(qc_df$sample, qc_df$parent_id)), ]
+
+ggplot(parent_df, aes(x = sample, y = n_subspots_for_parent, fill = sample)) +
+  geom_violin(scale = "width", linewidth = 0.3, show.legend = FALSE) +
+  geom_boxplot(width = 0.06, outlier.size = 0.5, fill = "white", show.legend = FALSE) +
+  labs(title = "Sub-spots generated per parent spot",
+       x = NULL, y = "Sub-spots per parent spot") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### UMI counts — parent spots vs sub-spots
+
+```{r qc-counts, fig.height=4}
+p_parent <- ggplot(parent_df, aes(x = sample, y = parent_umi, fill = sample)) +
+  geom_violin(scale = "width", linewidth = 0.3, show.legend = FALSE) +
+  geom_boxplot(width = 0.06, outlier.size = 0.3, fill = "white", show.legend = FALSE) +
+  scale_y_log10() +
+  labs(title = "Raw UMI per parent spot", x = NULL, y = "nCount (log10)") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_sub <- ggplot(qc_df, aes(x = sample, y = subspot_counts, fill = sample)) +
+  geom_violin(scale = "width", linewidth = 0.3, show.legend = FALSE) +
+  geom_boxplot(width = 0.06, outlier.size = 0.3, fill = "white", show.legend = FALSE) +
+  labs(title = "Total logcount sum per sub-spot", x = NULL, y = "Sum of logcounts") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_parent | p_sub
+```
+
+### Genes detected — parent spots vs sub-spots
+
+```{r qc-genes, fig.height=4}
+p_pgenes <- ggplot(parent_df, aes(x = sample, y = parent_genes, fill = sample)) +
+  geom_violin(scale = "width", linewidth = 0.3, show.legend = FALSE) +
+  geom_boxplot(width = 0.06, outlier.size = 0.3, fill = "white", show.legend = FALSE) +
+  labs(title = "Genes detected per parent spot", x = NULL, y = "nFeature") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_sgenes <- ggplot(qc_df, aes(x = sample, y = subspot_genes, fill = sample)) +
+  geom_violin(scale = "width", linewidth = 0.3, show.legend = FALSE) +
+  geom_boxplot(width = 0.06, outlier.size = 0.3, fill = "white", show.legend = FALSE) +
+  labs(title = "Genes detected per sub-spot", x = NULL, y = "nFeature") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+p_pgenes | p_sgenes
+```
+
+### Sparsity (zero fraction) per sub-spot
+
+```{r qc-sparsity, fig.height=4}
+ggplot(qc_df, aes(x = sample, y = subspot_zeros, fill = sample)) +
+  geom_violin(scale = "width", linewidth = 0.3, show.legend = FALSE) +
+  geom_boxplot(width = 0.06, outlier.size = 0.3, fill = "white", show.legend = FALSE) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Fraction of zeros per sub-spot (logcounts == 0)",
+       x = NULL, y = "Zero fraction") +
+  theme_classic(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### QC summary table
+
+```{r qc-table}
+qc_summary <- lapply(names(enhanced_list), function(s) {
+  sq  <- qc_df[qc_df$sample == s, ]
+  pq  <- sq[!duplicated(sq$parent_id), ]
+  data.frame(
+    sample              = s,
+    n_parent_spots      = nrow(pq),
+    n_subspots          = nrow(sq),
+    median_subspots_per_parent = round(median(pq$n_subspots_for_parent), 1),
+    median_parent_umi   = round(median(pq$parent_umi)),
+    median_parent_genes = round(median(pq$parent_genes)),
+    median_subspot_genes = round(median(sq$subspot_genes)),
+    median_zero_frac    = round(median(sq$subspot_zeros), 3)
+  )
+}) |> bind_rows()
+
+knitr::kable(qc_summary,
+             col.names = c("Sample", "Parent spots", "Sub-spots",
+                           "Median sub-spots/parent", "Median UMI/parent",
+                           "Median genes/parent", "Median genes/sub-spot",
+                           "Median zero frac"),
+             caption = "Enhancement QC — parent-spot and sub-spot level metrics")
+```
+
+## Spatial cluster plots
+
+```{r cluster-plots, fig.height=5, results='asis'}
+for (s in names(enhanced_list)) {
+  cat(sprintf("\n#### %s\n\n", s))
+  sce_enh <- enhanced_list[[s]]
+  coords  <- as.data.frame(colData(sce_enh))
+  coords$cluster <- factor(sce_enh$spatial.cluster)
+
+  p <- ggplot(coords, aes(array_col, -array_row, colour = cluster)) +
+    geom_point(size = 0.2, alpha = 0.7) +
+    coord_fixed() +
+    scale_colour_brewer(palette = "Set2") +
+    labs(title = s,
+         subtitle = sprintf("%d sub-spots from %d spots | nsubspot.per.edge = %d",
+                            nrow(coords),
+                            length(unique(coords$original_spot_id)),
+                            NSUBSPOT_PER_EDGE),
+         x = "array_col", y = "array_row", colour = "domain") +
+    theme_classic(base_size = 11) +
+    guides(colour = guide_legend(override.aes = list(size = 2)))
+
+  print(p)
+  cat("\n")
+}
+```
+
+## Summary
+
+```{r summary-table}
+summary_df <- lapply(names(enhanced_list), function(s) {
+  sce_enh <- enhanced_list[[s]]
+  data.frame(
+    sample           = s,
+    orig_spots       = length(unique(colData(sce_enh)$original_spot_id)),
+    sub_spots        = ncol(sce_enh),
+    subspots_per_spot = round(ncol(sce_enh) /
+                              length(unique(colData(sce_enh)$original_spot_id)), 1),
+    n_domains        = length(unique(sce_enh$spatial.cluster))
+  )
+}) |> bind_rows()
+
+knitr::kable(summary_df,
+             caption = sprintf("BayesSpace enhancement — nsubspot.per.edge = %d (~25 µm spacing)",
+                               NSUBSPOT_PER_EDGE))
+```
+
+## Save checkpoint
+
+```{r save}
+saveRDS(enhanced_list, OUT_RDS)
+cat(sprintf("Saved %d enhanced SCEs → %s\n", length(enhanced_list), OUT_RDS))
+```
+
+## Session info
+
+```{r session}
+sessionInfo()
+```
