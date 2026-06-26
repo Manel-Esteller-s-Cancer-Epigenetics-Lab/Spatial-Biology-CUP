@@ -1,0 +1,780 @@
+---
+title: "Xenium CUP/IC — Cohort-Level Marker Analysis"
+subtitle: "Actionable targets & immune checkpoints analysis"
+author: "Abu Saadat"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: left
+    toc-title: "Contents"
+    code-fold: true
+    code-tools: true
+    code-summary: "Show code"
+    self-contained: true
+    theme: cosmo
+    fig-width: 12
+    fig-height: 7
+    fig-dpi: 150
+    cap-location: bottom
+execute:
+  warning: false
+  message: false
+  cache: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, comment = NA, fig.align = "center")
+```
+
+# Configuration
+
+```{r config}
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+ANALYSIS_ROOT <- "."
+COHORT_RDS  <- file.path(ANALYSIS_ROOT, "cohort_slim_v2.rds")
+OUT_DIR     <- file.path(ANALYSIS_ROOT, "PLOTs", "03_classification")
+
+dir.create(file.path(OUT_DIR, "actionable_targets"), recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUT_DIR, "ICI"),                recursive = TRUE, showWarnings = FALSE)
+dir.create(file.path(OUT_DIR, "tables"),             recursive = TRUE, showWarnings = FALSE)
+
+# ── Marker gene groups ─────────────────────────────────────────────────────────
+GENES_HISTOLOGY  <- "KRT20"
+GENES_ACTIONABLE <- c("MET", "ERBB2", "KIT", "FGFR2", "CCNE1", "MYC")
+GENES_ICI        <- c("CD274", "LAG3", "CTLA4", "TIGIT", "PDCD1")
+
+# Display labels for axes / titles
+GENE_DISPLAY <- c(
+  CD274 = "PD-L1 (CD274)",
+  PDCD1 = "PD-1 (PDCD1)",
+  KRT20 = "CK20 (KRT20)",
+  ERBB2 = "ERBB2 (HER2)"
+)
+label_gene <- function(g) ifelse(g %in% names(GENE_DISPLAY), GENE_DISPLAY[g], g)
+
+# ── Colour scheme ──────────────────────────────────────────────────────────────
+COL_TUMOR   <- "#B22222"
+COL_STROMA  <- "#4393C3"
+COL_COMP    <- c("Tumor" = COL_TUMOR, "Stroma" = COL_STROMA, "Unassigned" = "grey60")
+
+# Sample colour palette (16 distinct colours)
+SAMPLE_COLS <- setNames(
+  c("#E41A1C","#377EB8","#4DAF4A","#984EA3","#FF7F00","#A65628",
+    "#F781BF","#999999","#66C2A5","#FC8D62","#8DA0CB","#E78AC3",
+    "#A6D854","#FFD92F","#E5C494","#B3B3B3"),
+  character(0)  # will be assigned after loading data
+)
+
+```
+
+---
+
+# Libraries
+
+```{r libraries}
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(patchwork)
+  library(scales)
+  library(knitr)
+  library(kableExtra)
+  library(ggbeeswarm)   # install.packages("ggbeeswarm") if missing
+  library(rstatix)      # install.packages("rstatix") if missing — Wilcoxon p-values
+  library(ggpubr)       # install.packages("ggpubr") if missing — stat_compare_means
+})
+```
+
+---
+
+# Load Cohort Data
+
+```{r load-data}
+
+if (!file.exists(COHORT_RDS)) {
+  stop("cohort_slim.rds not found: ", COHORT_RDS,
+       "\nRun 01_extract_cohort_data.R first.")
+}
+
+cohort <- readRDS(COHORT_RDS)
+
+# Assign consistent sample colours
+sample_names <- sort(unique(cohort$sample_name))
+SAMPLE_COLS  <- setNames(
+  scales::hue_pal()(length(sample_names)),
+  sample_names
+)
+
+# Filter to Tumor + Stroma only (exclude Unassigned from expression analyses)
+cohort_ts <- cohort |>
+  filter(Compartment_binary %in% c("Tumor", "Stroma"))
+
+cat(sprintf(
+  "Cohort loaded:\n  Samples    : %d\n  Total cells: %d\n  After QC filter (Tumor+Stroma): %d\n",
+  length(sample_names), nrow(cohort), nrow(cohort_ts)
+))
+```
+
+---
+
+# Sample Overview Table
+
+```{r sample-overview-table}
+
+overview <- cohort |>
+  group_by(sample_name) |>
+  summarise(
+    Total_cells    = n(),
+    Tumor_cells    = sum(Compartment_binary == "Tumor"),
+    Stroma_cells   = sum(Compartment_binary == "Stroma"),
+    Unassigned     = sum(Compartment_binary == "Unassigned"),
+    Pct_Tumor      = round(100 * Tumor_cells  / Total_cells, 1),
+    Pct_Stroma     = round(100 * Stroma_cells / Total_cells, 1),
+    Median_CF_score = round(median(CF_score, na.rm = TRUE), 3),
+    .groups = "drop"
+  ) |>
+  arrange(sample_name)
+
+write.csv(overview,
+          file.path(OUT_DIR, "tables", "01_sample_overview.csv"),
+          row.names = FALSE)
+
+overview |>
+  kable(caption = "Sample overview — cell counts and compartment distribution") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+```
+
+---
+
+# Actionable Targets
+
+## Violin plots — expression per sample {#violin-actionable}
+
+*One violin per sample, split by compartment (Tumor = red, Stroma = blue).
+Showing only expressing cells (log-normalised expression > 0) to reveal true
+signal distribution without zero-inflation collapsing the dynamic range.*
+
+```{r violin-actionable, fig.height=14, fig.width=16}
+
+# Long format — filter to expressing cells only (expression > 0)
+# Zero-inflated spatial data collapses violin/boxplots without this filter
+action_long <- cohort_ts |>
+  dplyr::select(cell_id, sample_name, Compartment_binary, all_of(GENES_ACTIONABLE)) |>
+  pivot_longer(cols = all_of(GENES_ACTIONABLE),
+               names_to  = "gene",
+               values_to = "expression") |>
+  filter(!is.na(expression), expression > 0) |>
+  mutate(gene = factor(gene, levels = GENES_ACTIONABLE))
+
+p_violin_list <- lapply(GENES_ACTIONABLE, function(g) {
+  ggplot(
+    action_long |> filter(gene == g),
+    aes(x = sample_name, y = expression, fill = Compartment_binary)
+  ) +
+    geom_violin(
+      trim      = TRUE,
+      scale     = "width",
+      alpha     = 0.75,
+      linewidth = 0.3
+    ) +
+    geom_boxplot(
+      width         = 0.15,
+      outlier.shape = NA,
+      position      = position_dodge(0.9),
+      fill          = "white",
+      linewidth     = 0.3
+    ) +
+    scale_fill_manual(values = COL_COMP, name = NULL) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    labs(
+      title = label_gene(g),
+      x     = NULL,
+      y     = "Log-normalised expression"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 12),
+      axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+      legend.position = "top"
+    )
+})
+
+p_violin_action <- wrap_plots(p_violin_list, ncol = 2)
+
+ggsave(
+  file.path(OUT_DIR, "actionable_targets", "violin_actionable_targets.png"),
+  p_violin_action,
+  width  = 16,
+  height = 14,
+  dpi    = 300,
+  bg     = "white"
+)
+
+p_violin_action
+```
+
+## Dot plot — mean expression × % expressing cells {#dotplot-actionable}
+
+*Each dot = one sample. Dot size = percentage of tumor cells with detectable
+expression (> 0). Dot colour = mean log-normalised expression in tumor cells.
+Threshold for "expressing": raw expression > 0 (any detected transcript).*
+
+```{r dotplot-actionable, fig.height=6, fig.width=10}
+
+dot_df <- cohort_ts |>
+  filter(Compartment_binary == "Tumor") |>
+  dplyr::select(sample_name, all_of(GENES_ACTIONABLE)) |>
+  pivot_longer(cols = all_of(GENES_ACTIONABLE),
+               names_to  = "gene",
+               values_to = "expression") |>
+  filter(!is.na(expression)) |>
+  group_by(sample_name, gene) |>
+  summarise(
+    mean_expr   = mean(expression, na.rm = TRUE),
+    pct_express = 100 * mean(expression > 0, na.rm = TRUE),
+    .groups     = "drop"
+  ) |>
+  mutate(gene = factor(gene, levels = GENES_ACTIONABLE))
+
+p_dot_action <- ggplot(dot_df,
+    aes(x = gene, y = sample_name,
+        size  = pct_express,
+        color = mean_expr)) +
+  geom_point(alpha = 0.85) +
+  scale_size_continuous(
+    name   = "% expressing\ntumor cells",
+    range  = c(1, 12),
+    breaks = c(10, 25, 50, 75, 100)
+  ) +
+  scale_color_gradientn(
+    name   = "Mean log-norm\nexpression",
+    colors = c("grey90", "#FDBB84", "#E34A33", "#7F0000")
+  ) +
+  scale_x_discrete(labels = label_gene) +
+  labs(
+    title    = "Actionable Targets — Tumor Cells",
+    subtitle = "Dot size = % expressing cells | Colour = mean expression",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey40"),
+    axis.text.x   = element_text(angle = 30, hjust = 1, face = "bold", size = 11),
+    axis.text.y   = element_text(size = 9),
+    legend.position = "right"
+  )
+
+ggsave(
+  file.path(OUT_DIR, "actionable_targets", "dotplot_actionable_targets.png"),
+  p_dot_action,
+  width  = 10,
+  height = 6,
+  dpi    = 300,
+  bg     = "white"
+)
+
+p_dot_action
+```
+
+## Cell counts expressing each marker {#counts-expressing}
+
+*Number of cells (absolute count) with detectable expression (> 0) per sample,
+split by Tumor and Stroma. Gives an immediate sense of which markers have
+meaningful signal and in which compartment before looking at expression levels.
+Bars are stacked: Tumor on top of Stroma.*
+
+```{r counts-expressing, fig.height=14, fig.width=16}
+
+# All markers — histology + actionable + ICI
+ALL_GENES_PLOT <- c(GENES_HISTOLOGY, GENES_ACTIONABLE, GENES_ICI)
+
+# Count expressing cells per sample x gene x compartment
+counts_expr <- cohort_ts |>
+  dplyr::select(cell_id, sample_name, Compartment_binary,
+                all_of(ALL_GENES_PLOT)) |>
+  pivot_longer(cols      = all_of(ALL_GENES_PLOT),
+               names_to  = "gene",
+               values_to = "expression") |>
+  filter(!is.na(expression)) |>
+  group_by(sample_name, gene, Compartment_binary) |>
+  summarise(
+    n_expressing = sum(expression > 0, na.rm = TRUE),
+    n_total      = n(),
+    pct_pos      = 100 * n_expressing / n_total,
+    .groups      = "drop"
+  ) |>
+  mutate(
+    gene               = factor(gene, levels = ALL_GENES_PLOT),
+    Compartment_binary = factor(Compartment_binary,
+                                levels = c("Stroma", "Tumor"))
+  )
+
+# ── Plot 1: Stacked bar — absolute cell counts ────────────────────────────────
+p_counts_list <- lapply(ALL_GENES_PLOT, function(g) {
+  ggplot(
+    counts_expr |> filter(gene == g),
+    aes(x = sample_name, y = n_expressing, fill = Compartment_binary)
+  ) +
+    geom_col(width = 0.75, color = "white", linewidth = 0.25) +
+    geom_text(
+      aes(label = ifelse(n_expressing >= 500,
+                         scales::comma(n_expressing), "")),
+      position = position_stack(vjust = 0.5),
+      size     = 2.5,
+      color    = "white",
+      fontface = "bold"
+    ) +
+    scale_fill_manual(values = COL_COMP, name = NULL) +
+    scale_y_continuous(labels = scales::comma,
+                       expand = expansion(mult = c(0, 0.05))) +
+    labs(
+      title = label_gene(g),
+      x     = NULL,
+      y     = "Expressing cells (n)"
+    ) +
+    theme_classic(base_size = 9) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 10),
+      axis.text.x     = element_text(angle = 45, hjust = 1, size = 7),
+      legend.position = "top",
+      legend.text     = element_text(size = 8)
+    )
+})
+
+p_counts_stacked <- wrap_plots(p_counts_list, ncol = 3) +
+  plot_annotation(
+    title    = "Cells Expressing Each Marker — Absolute Counts",
+    subtitle = "Stacked by compartment (Tumor + Stroma) | expression > 0"
+  )
+
+ggsave(
+  file.path(OUT_DIR, "actionable_targets",
+            "cell_counts_expressing_all_markers.png"),
+  p_counts_stacked,
+  width  = 16,
+  height = 14,
+  dpi    = 300,
+  bg     = "white"
+)
+
+p_counts_stacked
+```
+
+```{r counts-pct-heatmap, fig.height=7, fig.width=14}
+
+# ── Plot 2: Heatmap — % expressing cells per sample x gene x compartment ──────
+# Gives a compact cohort-wide overview in a single figure
+library(tidyr)
+
+pct_mat <- counts_expr |>
+  mutate(label = paste0(Compartment_binary)) |>
+  dplyr::select(sample_name, gene, Compartment_binary, pct_pos) |>
+  mutate(facet_var = Compartment_binary)
+
+p_pct_heat <- ggplot(pct_mat,
+    aes(x = gene, y = sample_name, fill = pct_pos)) +
+  geom_tile(color = "white", linewidth = 0.4) +
+  geom_text(
+    aes(label = ifelse(pct_pos >= 1, paste0(round(pct_pos, 1), "%"), "")),
+    size     = 2.5,
+    color    = "grey10",
+    fontface = "bold"
+  ) +
+  scale_fill_gradientn(
+    name   = "% expressing
+cells",
+    colors = c("grey95", "#FDBB84", "#E34A33", "#7F0000"),
+    limits = c(0, NA)
+  ) +
+  scale_x_discrete(labels = label_gene) +
+  facet_wrap(~ Compartment_binary, ncol = 1) +
+  labs(
+    title    = "% Expressing Cells per Sample × Marker",
+    subtitle = "Tumor and Stroma shown separately | expression > 0",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_classic(base_size = 10) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(hjust = 0.5, color = "grey40"),
+    axis.text.x     = element_text(angle = 35, hjust = 1,
+                                   face = "bold", size = 9),
+    axis.text.y     = element_text(size = 8),
+    strip.text      = element_text(face = "bold", size = 10),
+    legend.position = "right"
+  )
+
+ggsave(
+  file.path(OUT_DIR, "actionable_targets",
+            "heatmap_pct_expressing_all_markers.png"),
+  p_pct_heat,
+  width  = 14,
+  height = 7,
+  dpi    = 300,
+  bg     = "white"
+)
+
+p_pct_heat
+```
+
+## Actionable targets — summary tables {#tables-actionable}
+
+```{r table-actionable}
+
+# Table 1: mean expression by sample × gene × compartment
+action_summary <- cohort_ts |>
+  dplyr::select(sample_name, Compartment_binary, all_of(GENES_ACTIONABLE)) |>
+  pivot_longer(cols = all_of(GENES_ACTIONABLE),
+               names_to  = "gene",
+               values_to = "expression") |>
+  filter(!is.na(expression)) |>
+  group_by(sample_name, Compartment_binary, gene) |>
+  summarise(
+    n_cells     = n(),
+    mean_expr   = round(mean(expression), 4),
+    median_expr = round(median(expression), 4),
+    pct_pos     = round(100 * mean(expression > 0), 2),
+    .groups     = "drop"
+  ) |>
+  arrange(gene, sample_name, Compartment_binary)
+
+write.csv(action_summary,
+          file.path(OUT_DIR, "tables", "02_actionable_targets_summary.csv"),
+          row.names = FALSE)
+
+# Wide pivot for easy reading in the report
+action_wide <- dot_df |>
+  mutate(
+    mean_expr   = round(mean_expr, 3),
+    pct_express = round(pct_express, 1)
+  ) |>
+  pivot_wider(
+    names_from   = gene,
+    values_from  = c(mean_expr, pct_express),
+    names_glue   = "{gene}_{.value}"
+  )
+
+action_wide |>
+  kable(caption = "Actionable targets — tumor cell summary per sample") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width        = TRUE,
+                font_size         = 11) |>
+  scroll_box(width = "100%")
+```
+
+---
+
+# Immune Checkpoints
+
+## Stacked bar — % transcripts in Tumor vs Stroma {#stacked-ici}
+
+*For each sample × ICI gene, the percentage of total transcripts
+(approximated by summed expression) found in Tumor vs Stroma cells.
+Unassigned cells are excluded. Directly answers Dr. Esteller's Q2.*
+
+```{r stacked-ici, fig.height=12, fig.width=14}
+
+# Sum of normalised expression per sample × gene × compartment
+ici_long <- cohort_ts |>
+  dplyr::select(cell_id, sample_name, Compartment_binary, all_of(GENES_ICI)) |>
+  pivot_longer(cols = all_of(GENES_ICI),
+               names_to  = "gene",
+               values_to = "expression") |>
+  filter(!is.na(expression))
+
+ici_comp_sum <- ici_long |>
+  group_by(sample_name, gene, Compartment_binary) |>
+  summarise(total_expr = sum(expression, na.rm = TRUE), .groups = "drop") |>
+  group_by(sample_name, gene) |>
+  mutate(pct = 100 * total_expr / sum(total_expr)) |>
+  ungroup() |>
+  mutate(
+    gene         = factor(gene, levels = GENES_ICI),
+    gene_display = label_gene(gene)
+  )
+
+p_stacked_list <- lapply(GENES_ICI, function(g) {
+  ggplot(
+    ici_comp_sum |> filter(gene == g),
+    aes(x = sample_name, y = pct, fill = Compartment_binary)
+  ) +
+    geom_col(width = 0.75, color = "white", linewidth = 0.3) +
+    geom_text(
+      aes(label = ifelse(pct >= 5, paste0(round(pct, 0), "%"), "")),
+      position  = position_stack(vjust = 0.5),
+      size      = 3,
+      color     = "white",
+      fontface  = "bold"
+    ) +
+    scale_fill_manual(values = COL_COMP, name = NULL) +
+    scale_y_continuous(labels = percent_format(scale = 1),
+                       expand = expansion(mult = c(0, 0.02))) +
+    labs(
+      title = label_gene(g),
+      x     = NULL,
+      y     = "% of total expression"
+    ) +
+    theme_classic(base_size = 10) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 11),
+      axis.text.x     = element_text(angle = 45, hjust = 1, size = 8),
+      legend.position = "top"
+    )
+})
+
+p_stacked_ici <- wrap_plots(p_stacked_list, ncol = 2) +
+  plot_annotation(
+    title    = "ICI Biomarkers — Transcript Distribution: Tumor vs Stroma",
+    subtitle = "% of summed normalised expression per compartment per sample"
+  )
+
+ggsave(
+  file.path(OUT_DIR, "ICI", "stacked_bar_ICI_tumor_vs_stroma.png"),
+  p_stacked_ici,
+  width  = 14,
+  height = 12,
+  dpi    = 300,
+  bg     = "white"
+)
+
+p_stacked_ici
+```
+
+## Grouped boxplot — % expressing cells: Tumor vs Stroma {#boxplot-ici}
+
+*Each dot = one sample. X-axis = compartment. Y-axis = percentage of cells
+with detectable expression (> 0) for that ICI gene. Wilcoxon signed-rank test
+(paired by sample, two-sided) on % expressing cells. P-values BH-corrected
+across genes. This approach avoids zero-inflation bias of cell-level tests.*
+
+```{r boxplot-ici, fig.height=10, fig.width=14}
+
+# Compute % expressing cells per sample x gene x compartment
+pct_express <- ici_long |>
+  filter(Compartment_binary %in% c("Tumor", "Stroma")) |>
+  group_by(sample_name, gene, Compartment_binary) |>
+  summarise(
+    n_cells   = n(),
+    n_pos     = sum(expression > 0, na.rm = TRUE),
+    pct_pos   = 100 * n_pos / n_cells,
+    .groups   = "drop"
+  ) |>
+  mutate(
+    gene               = factor(gene, levels = GENES_ICI),
+    Compartment_binary = factor(Compartment_binary, levels = c("Stroma", "Tumor"))
+  )
+
+# Wilcoxon signed-rank test on % expressing cells
+# paired = TRUE: same sample contributes one Tumor value and one Stroma value
+wilcox_pct <- pct_express |>
+  group_by(gene) |>
+  # keep only samples that have both compartments
+  filter(length(unique(Compartment_binary[Compartment_binary %in% c("Tumor","Stroma")])) == 2 |
+         TRUE) |>
+  ungroup() |>
+  group_by(gene) |>
+  rstatix::wilcox_test(pct_pos ~ Compartment_binary, paired = FALSE) |>
+  rstatix::adjust_pvalue(method = "BH") |>
+  rstatix::add_significance("p.adj") |>
+  ungroup()
+
+# y position for annotation — above the max % in each gene panel
+y_pos_pct <- pct_express |>
+  group_by(gene) |>
+  summarise(y_label = max(pct_pos, na.rm = TRUE) * 1.12, .groups = "drop")
+
+wilcox_pct <- wilcox_pct |>
+  left_join(y_pos_pct, by = "gene") |>
+  mutate(x_label = 1.5)
+
+# One panel per ICI gene — dot plot showing per-sample % expressing cells
+p_box_list <- lapply(GENES_ICI, function(g) {
+
+  dat_g   <- pct_express |> filter(gene == g)
+  annot_g <- wilcox_pct  |> filter(gene == g) |>
+    dplyr::select(x_label, y_label, p.adj.signif, p.adj)
+
+  # Long-format data for paired lines and points
+  dat_lines <- dat_g |>
+    dplyr::select(sample_name, Compartment_binary, pct_pos) |>
+    filter(Compartment_binary %in% c("Stroma", "Tumor")) |>
+    mutate(Compartment_binary = factor(Compartment_binary,
+                                       levels = c("Stroma", "Tumor")))
+
+  ggplot(dat_lines,
+         aes(x = Compartment_binary, y = pct_pos)) +
+    geom_line(
+      aes(group = sample_name),
+      color     = "grey75",
+      linewidth = 0.4
+    ) +
+    geom_boxplot(
+      aes(fill = Compartment_binary),
+      outlier.shape = NA,
+      alpha         = 0.4,
+      linewidth     = 0.4,
+      width         = 0.45,
+      color         = "grey30"
+    ) +
+    geom_point(
+      aes(fill = Compartment_binary),
+      size   = 3,
+      alpha  = 0.9,
+      shape  = 21,
+      color  = "grey20",
+      stroke = 0.4
+    ) +
+    geom_text(
+      data        = annot_g,
+      mapping     = aes(x = x_label,
+                        y = y_label,
+                        label = paste0(p.adj.signif,
+                                       " (p.adj=", signif(p.adj, 2), ")")),
+      inherit.aes = FALSE,
+      size        = 3,
+      fontface    = "bold",
+      color       = "grey20",
+      hjust       = 0.5
+    ) +
+    scale_fill_manual(values = COL_COMP, name = NULL) +
+    scale_y_continuous(
+      labels = function(x) paste0(x, "%"),
+      expand = expansion(mult = c(0.05, 0.15))
+    ) +
+    labs(
+      title = label_gene(g),
+      x     = NULL,
+      y     = "% expressing cells"
+    ) +
+    theme_classic(base_size = 11) +
+    theme(
+      plot.title      = element_text(face = "bold", hjust = 0.5, size = 13),
+      legend.position = "none",
+      axis.text.x     = element_text(size = 11, face = "bold")
+    )
+})
+
+p_box_ici <- wrap_plots(p_box_list, ncol = 3)
+
+ggsave(
+  file.path(OUT_DIR, "ICI", "boxplot_ICI_pct_expressing_tumor_vs_stroma.png"),
+  p_box_ici,
+  width  = 14,
+  height = 10,
+  dpi    = 300,
+  bg     = "white"
+)
+
+p_box_ici
+```
+
+## ICI — summary tables {#tables-ici}
+
+```{r table-ici}
+
+# Table 1: Expression summary per sample × gene × compartment
+ici_summary <- ici_long |>
+  group_by(sample_name, gene, Compartment_binary) |>
+  summarise(
+    n_cells     = n(),
+    mean_expr   = round(mean(expression), 4),
+    median_expr = round(median(expression), 4),
+    pct_pos     = round(100 * mean(expression > 0), 2),
+    sum_expr    = round(sum(expression), 2),
+    .groups     = "drop"
+  ) |>
+  arrange(gene, sample_name, Compartment_binary)
+
+write.csv(ici_summary,
+          file.path(OUT_DIR, "tables", "03_ICI_expression_summary.csv"),
+          row.names = FALSE)
+
+# Table 2: % transcript in Tumor vs Stroma (what the stacked bar shows)
+ici_pct_table <- ici_comp_sum |>
+  dplyr::select(sample_name, gene, Compartment_binary, pct) |>
+  mutate(pct = round(pct, 2)) |>
+  pivot_wider(names_from = Compartment_binary, values_from = pct) |>
+  arrange(gene, sample_name)
+
+write.csv(ici_pct_table,
+          file.path(OUT_DIR, "tables", "04_ICI_pct_transcript_tumor_vs_stroma.csv"),
+          row.names = FALSE)
+
+# Table 3: Wilcoxon test results
+write.csv(wilcox_pct,
+          file.path(OUT_DIR, "tables", "05_ICI_wilcoxon_tumor_vs_stroma.csv"),
+          row.names = FALSE)
+
+# Display Wilcoxon results in report
+# wilcox_pct is gene-level (% expressing cells across all samples)
+wilcox_pct |>
+  dplyr::select(gene, group1, group2, statistic, p, p.adj, p.adj.signif) |>
+  mutate(
+    p     = signif(p, 3),
+    p.adj = signif(p.adj, 3)
+  ) |>
+  kable(caption = "Wilcoxon test: % expressing cells Tumor vs Stroma (BH-adjusted)") |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width        = FALSE,
+                font_size         = 11)
+```
+
+---
+
+# KRT20 (Histology)
+
+```{r krt20, fig.height=5, fig.width=12}
+
+# Filter to expressing cells only (KRT20 > 0) — same approach as other markers
+krt_long <- cohort_ts |>
+  dplyr::select(sample_name, Compartment_binary, KRT20) |>
+  filter(!is.na(KRT20), KRT20 > 0)
+
+p_krt20 <- ggplot(krt_long,
+    aes(x = sample_name, y = KRT20, fill = Compartment_binary)) +
+  geom_violin(trim = TRUE, scale = "width", alpha = 0.75, linewidth = 0.3) +
+  geom_boxplot(width = 0.12, outlier.shape = NA,
+               position = position_dodge(0.9),
+               fill = "white", linewidth = 0.3) +
+  scale_fill_manual(values = COL_COMP, name = NULL) +
+  labs(
+    title    = "CK20 (KRT20) — Expressing Cells Only (> 0)",
+    subtitle = "Tumor vs Stroma | log-normalised expression",
+    x        = NULL,
+    y        = "Log-normalised expression"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5),
+    plot.subtitle   = element_text(hjust = 0.5, color = "grey40"),
+    axis.text.x     = element_text(angle = 45, hjust = 1),
+    legend.position = "top"
+  )
+
+ggsave(
+  file.path(OUT_DIR, "actionable_targets", "violin_KRT20.png"),
+  p_krt20,
+  width  = 12,
+  height = 5,
+  dpi    = 300,
+  bg     = "white"
+)
+
+p_krt20
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

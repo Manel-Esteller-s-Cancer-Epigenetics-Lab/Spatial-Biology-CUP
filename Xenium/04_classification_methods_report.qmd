@@ -1,0 +1,340 @@
+---
+title: "CUP Cohort - Classification (19 Samples)"
+author: "Abu Saadat"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: "right"
+    toc-title: "Contents"
+    toc-expand: true
+    code-fold: true
+    code-tools: false
+    code-summary: "Hide code"
+    self-contained: true
+    fig-width: 12
+    fig-height: 7
+    fig-dpi: 150
+    cap-location: bottom
+    fontsize: 1.05em
+    linestretch: 1.6
+    theme:
+      light: "cosmo"
+      dark : "cyborg"
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+```{css, echo = FALSE}
+.justify {
+  text-align: justify !important
+}
+```
+
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+ANALYSIS_ROOT  <- "."
+CLASS_DIR      <- file.path(ANALYSIS_ROOT, "Classification")
+PLOT_DIR       <- file.path(ANALYSIS_ROOT, "PLOTs", "03_classification")
+COHORT_PLOTS   <- file.path(ANALYSIS_ROOT, "Cohort_Plots")
+
+# ── Load results ───────────────────────────────────────────────────────────────
+thresholds     <- read.csv(file.path(CLASS_DIR, "threshold_table.csv"))
+hscores        <- read.csv(file.path(CLASS_DIR, "hscores_per_sample.csv"))
+classification <- read.csv(file.path(CLASS_DIR, "sample_classification.csv"))
+
+# ── Gene groups ────────────────────────────────────────────────────────────────
+GENES_EPITHELIAL <- c("KRT20","MET","ERBB2","KIT","FGFR2","CCNE1","MYC")
+GENES_ICI        <- c("CD274","LAG3","CTLA4","TIGIT","PDCD1")
+ALL_GENES        <- c(GENES_EPITHELIAL, GENES_ICI)
+
+GENE_DISPLAY <- c(
+  CD274 = "PD-L1 (CD274)", PDCD1 = "PD-1 (PDCD1)",
+  KRT20 = "CK20 (KRT20)", ERBB2 = "ERBB2 (HER2)"
+)
+label_gene <- function(g) ifelse(g %in% names(GENE_DISPLAY), GENE_DISPLAY[g], g)
+
+CLASS_COLS <- c(
+  "Negative" = "#2166AC",
+  "Low"      = "#FEE08B",
+  "Positive" = "#D73027",
+  "High"     = "#7F0000"
+)
+```
+
+
+# Overview
+
+::: {.justify}
+
+This document explains how we moved from raw single-cell spatial transcriptomics measurements to a final classification of each tumor sample as **Positive** or **Negative** for each of the 12 marker genes analysed.
+
+* **The classification workflow has three sequential phases:**
+
+  + Step 1  →  Define what "positive" means at the CELL level (t_cell threshold)
+  + Step 2  →  Compute a Spatial H-Score for each SAMPLE (quantitative ranking)
+  + Step 3  →  Classify each SAMPLE as Negative / Low / Positive / High (K-means)
+
+:::
+
+# Step 1: Defining a Positive cell
+
+## The challenge: not all detected signal is real
+
+::: {.justify}
+
+Xenium detects individual mRNA molecules inside each cell by imaging fluorescently labelled probes. However, not every detected signal is a genuine transcript — some arise from:
+
+- **Optical noise**: Stray photons or fluorescence bleed-through between channels
+- **Non-specific probe binding**: A probe attaching to an unintended sequence
+- **Decoding errors**: The MERFISH-based spatial barcoding incorrectly reading a signal
+
+If we simply counted every cell with any detected signal as "positive", we might include a large amount of technical background. We therefore need a **threshold** ($t_{cell}$) below which a cell's expression is considered noise and above which it is considered genuine signal.
+
+We used two complementary methods depending on the type of marker gene.
+
+:::
+
+## Method A - Negative Control Probes
+
+### What they are
+
+::: {.justify}
+
+The challenge of separating signal from noise in tissue measurements is as old as the technique itself. In Xenium, 10x Genomics addresses this directly by including **40 Negative Control Probes** in every panel. These are synthetic sequences computationally designed to have no match anywhere in the human genome. They are physically present in the experiment, undergo the same imaging and decoding process as real probes, but in a perfect system they should detect nothing.
+
+Any signal they do detect is therefore **pure technical noise**, giving us an empirical measurement of the noise floor specific to your tissue, your experiment, and your instrument on that day.
+
+:::
+
+### How we computed the threshold
+
+::: {.justify}
+
+We extracted the Negative Control Probe counts from the raw data files of all 19 samples. For each cell, we summed the counts across all 40 probes and divided by 40 to get the **mean background count per probe per cell**. We then computed the **mean + 2 standard deviations** of this distribution across the entire cohort.
+
+:::
+
+```{r negctrl-plot, fig.cap="**Figure 1.** Distribution of Negative Control Probe expression across all 19 samples. The near-zero distribution confirms excellent technical quality. The red dashed line shows the mean+2SD threshold used to anchor all cell-level positivity calls."}
+knitr::include_graphics(file.path(PLOT_DIR, "negcontrol_distribution.png"))
+```
+
+::: {.callout-tip}
+## Key point about the NegControl threshold
+If a cell's expression of a real marker gene is less than 0.0032 (in the same units), we cannot be confident it is not just noise. Any cell with expression above this level has signal that exceeds the technical background of the experiment. For our clean data, this is nearly equivalent to "any detected transcript is real signal."
+:::
+
+---
+
+## Method B - Stromal Floor (used for epithelial markers)
+
+::: {.justify}
+
+For markers that should be expressed predominantly in epithelial tumour cells like *KRT20* (cytokeratin), *MET*, *ERBB2*, *KIT*, *FGFR2*, *CCNE1*, *MYC*, we can use the **stromal compartment** as a control.
+
+Stroma consists of fibroblasts, endothelial cells, and non-epithelial supporting cells. These cells should not express epithelial markers. By computing the **95th percentile of expression** within the confirmed stromal cells across the cohort, we define the level that 95% of stromal cells fall below. Any tumour cell expressing above this level is expressing the marker above the level seen in the biological negative control tissue, making it positive.
+
+:::
+
+```{r stromal-plot, fig.cap="**Figure 2.** Expression density of epithelial markers in stromal cells (blue). The red dashed line shows the 95th percentile stromal floor. The green dotted line shows the NegControl-derived threshold. Both converge near zero, confirming the epithelial markers are stroma-exclusive in this cohort."}
+knitr::include_graphics(file.path(PLOT_DIR, "stromal_floor_epithelial.png"))
+```
+
+::: {.callout-warning}
+## Why we did NOT use the stromal floor for immune checkpoint markers
+Immune checkpoint genes require compartment-specific analysis:
+
+- **PD-L1 (CD274)** shows dual expression: tumour cells upregulate PD-L1 to suppress immune attack, and tumour-infiltrating immune cells also express it. We therefore apply a **Combined Positive Score (CPS)**, pooling positive cells from both tumour and stromal compartments with the total tumour cell count as the denominator — matching the clinical CPS definition used in PD-L1 IHC reporting.
+- **LAG3, CTLA4, TIGIT, PD-1 (PDCD1)** are T-cell exhaustion markers expressed by immune cells within the stromal compartment. Scoring these in tumour cells would miss their biology entirely; they are therefore assessed in stromal cells only.
+
+In both cases, the stromal floor is not a valid negative control, so a GMM (below) is used to set the threshold.
+:::
+
+---
+
+## Method C - Gaussian Mixture Models (for ICI markers)
+
+### The biological question
+
+::: {.justify}
+
+For immune checkpoint markers, the stromal floor cannot serve as a negative control (see above). Within the relevant compartment for each gene, cells separate into two natural populations:
+
+1. Cells with **low-level, basal expression**: A small number of transcripts, possibly reflecting transcriptional noise or very low pathway activity
+2. Cells with **high-level, genuine expression**: Many transcripts, reflecting true immune checkpoint engagement
+
+We identify the natural boundary between these two populations using a GMM fitted on the appropriate cells: **pooled tumour + stromal cells** for CD274 (CPS), and **stromal cells only** for LAG3, CTLA4, TIGIT, and PDCD1.
+
+:::
+
+### How GMM works
+
+::: {.justify}
+
+A **Gaussian Mixture Model (GMM)** is a statistical model that assumes the observed data comes from a mixture of several Gaussian (bell-shaped) distributions, each representing a different underlying population. We fitted a **two-component GMM** to the expression values of cells with any detectable expression (> 0), using the compartment-appropriate population described above (pooled tumour + stroma for CD274; stroma only for LAG3, CTLA4, TIGIT, PDCD1).
+
+The model finds:
+- **Component 1** (low): the mean and spread of the low-expressing population
+- **Component 2** (high): the mean and spread of the high-expressing population
+- The **mixing proportions**: what fraction of cells belong to each component
+
+The threshold is then set at the **intersection point** of the two components — the expression level at which a cell is equally likely to belong to either population. Above this point, a cell is more likely to be a genuine high-expresser than a low-level background cell.
+
+:::
+
+```{r gmm-plot, fig.cap="**Figure 3.** GMM fits for the five immune checkpoint markers. PD-L1 (CD274) is fitted on pooled tumour + stromal cells (CPS approach); LAG3, CTLA4, TIGIT and PD-1 (PDCD1) are fitted on stromal cells only. Blue curve = low-expressing component; red curve = high-expressing component; dashed black = total mixture; green vertical line = final threshold (t_cell)."}
+knitr::include_graphics(file.path(PLOT_DIR, "gmm_fits_ICI.png"))
+```
+
+### Selecting the final thresholds
+
+::: {.justify}
+
+The final cell-level threshold for each gene is the **more conservative** of the NegControl-derived threshold and the method-specific threshold (stromal floor or GMM). This ensures we never classify a cell as positive if it does not pass both the technical noise filter and the biological signal filter.
+
+:::
+
+```{r threshold-table}
+thresholds |>
+  dplyr::mutate(
+    gene             = sapply(gene, label_gene),
+    negctrl_threshold = round(negctrl_threshold, 4),
+    stromal_floor    = round(stromal_floor, 4),
+    gmm_threshold    = round(gmm_threshold, 4),
+    t_cell           = round(t_cell, 4)
+  ) |>
+  dplyr::select(gene, method_primary, method_secondary,
+                negctrl_threshold, stromal_floor, gmm_threshold, t_cell) |>
+  kable(
+    col.names = c("Gene", "Primary method", "Validation method",
+                  "NegControl threshold", "Stromal floor",
+                  "GMM threshold", "Final t_cell"),
+    caption   = "Table 1. Cell-level positivity thresholds per marker gene. t_cell = max(NegControl, method-specific threshold)."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 12) |>
+  column_spec(7, bold = TRUE, color = "#B22222")
+```
+
+::: {.callout-note}
+## Key observation
+The NegControl threshold (0.003) is near zero for all genes, confirming the experiments are clean. For epithelial markers, the final threshold is this near-zero value showing that any detected transcript above background should be counted as positive. For ICI markers, the GMM threshold (2.8–3.6) is far more stringent, a tumour cell needs approximately 15–30 raw transcripts to qualify as a true immune checkpoint expresser.
+:::
+
+---
+
+# Step 2: The Spatial H-Score: Ranking Samples Quantitatively
+
+## From the original H-Score to our spatial adaptation
+
+::: {.justify}
+
+In traditional pathology, a trained pathologist scores each immunohistochemistry (IHC) slide by visually classifying cells into four staining intensity categories — negative (0), weak (1+), moderate (2+), or strong (3+) — and computing:
+
+:::
+
+$$H\text{-Score}_{IHC} = 1 \times (\% \text{ weak}) + 2 \times (\% \text{ moderate}) + 3 \times (\% \text{ strong})$$
+
+::: {.justify}
+This produces a score that captures both **how many cells are positive** and **how intensely they stain** *(McCarty et al., Cancer Research, 1986)*.
+
+The problem with applying this directly to spatial transcriptomics is that we do not have discrete 1+/2+/3+ categories but instead have continuous, quantitative expression values for every cell. We therefore derived a **Spatial H-Score** that adapts the original formula to take advantage of the superior quantitative resolution of single-cell transcriptomics:
+:::
+$$\text{Spatial H-Score} = \underbrace{\% \text{ cells} > t_{cell}}_{\text{Penetrance}} \times \underbrace{\overline{\text{expression}}_{\text{positive cells only}}}_{\text{Intensity}}$$
+
+::: {.callout-note collapse="true"}
+## Compartment used per gene group
+- **Epithelial markers** (KRT20, MET, ERBB2, KIT, FGFR2, CCNE1, MYC): tumour cells only
+- **PD-L1 (CD274)**: Combined Positive Score — positive cells from tumour + stroma pooled, denominator = total tumour cells
+- **LAG3, CTLA4, TIGIT, PD-1 (PDCD1)**: stromal cells only
+:::
+
+### Why this formula captures what matters clinically
+
+::: {.justify}
+
+The two components measure fundamentally different and complementary aspects of biology:
+
+**Penetrance** asks: *what proportion of cells (in the relevant compartment) are expressing this marker?* A marker expressed in 80% of cells is clinically very different from one expressed in 5%, even if the expressing cells look identical. For PD-L1 (CD274), penetrance counts both tumour and stromal positive cells against the total tumour cell count, matching the clinical CPS definition. This is directly analogous to the percentage component of the IHC H-Score.
+
+**Intensity** asks: *how highly do the positive cells express it?* Among cells that express the marker, high expression reflects pathway amplification, gene copy number gain, or strong transcriptional activation. Mean expression computed only over positive cells (not all cells) ensures this value is not diluted by the zero-inflated majority.
+
+The **product** ensures both dimensions contribute to the final score. Consider:
+:::
+
+```{r hscore-example, echo=FALSE}
+data.frame(
+  Sample     = c("A (broad, low)", "B (focal, high)", "C (broad, high)"),
+  Penetrance = c("80%", "20%", "80%"),
+  Intensity  = c(1.0, 4.0, 4.0),
+  H_Score    = c(80, 80, 320)
+) |>
+  kable(caption = "Table 2. Hypothetical examples showing why both penetrance and intensity matter. Samples A and B have identical H-Scores but different biology. Sample C is correctly ranked highest.") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+## H-Score across the cohort
+
+```{r hscore-heatmap, fig.cap="**Figure 4.** Spatial H-Score heatmap for all 19 samples × 12 markers. Colour intensity reflects the H-Score value. Numbers inside each cell show the exact score."}
+knitr::include_graphics(file.path(PLOT_DIR, "hscore_heatmap.png"))
+
+```
+
+---
+
+# Step 3: Sample Classification
+
+::: {.justify}
+
+Once we have a continuous H-Score for each sample, we still need to decide: is this sample **positive** for this marker? One approach would be to set a fixed cutoff, for example, call any sample with H-Score > 50 as positive. But this is arbitrary and cohort-specific.
+
+A better approach is to ask: **does the data itself reveal natural groupings?** If MET H-Scores in our cohort naturally cluster into two groups: one near zero and one much higher, then the biology itself is telling us there are genuinely MET-negative and MET-positive tumours.
+:::
+## K-means clustering (data driven thresholding)
+::: {.justify}
+**K-means clustering** is an unsupervised algorithm that partitions a set of values into $k$ groups, minimising the spread within each group. Applied to a single gene's H-Score values across 19 samples (1-dimensional clustering), it finds the natural breakpoints in the distribution.
+
+We applied K-means separately to each gene, testing $k = 2$ and $k = 3$. The optimal $k$ was chosen using the **gap statistic**, a method that compares the within-group spread of your real data against what would be expected from randomly distributed data. When $k = 2$ fits substantially better than $k = 1$, we use $k = 2$ (Negative / Positive). When $k = 3$ fits better than $k = 2$, we use $k = 3$ (Negative / Low / High).
+
+The gap statistic results for your cohort:
+:::
+```{r gap-stat-table}
+classification |>
+  dplyr::select(gene, k_used) |>
+  dplyr::distinct() |>
+  dplyr::mutate(
+    gene   = sapply(gene, label_gene),
+    k_used = as.integer(k_used),
+    labels = ifelse(k_used == 2,
+                    "Negative / Positive",
+                    "Negative / Low / High")
+  ) |>
+  kable(
+    col.names = c("Gene", "Optimal k", "Classification labels"),
+    caption   = "Table 3. Optimal number of clusters chosen by gap statistic for each gene."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 12)
+```
+
+::: {.justify}
+Most genes showed a clean two-group structure (Negative / Positive). CCNE1 showed three groups, reflecting its heterogeneous expression across the cohort with one clearly amplified sample (CUP_383), an intermediate group, and a negative group.
+:::
+## Classification results
+
+```{r classification-heatmap, fig.cap="**Figure 5.** Sample classification heatmap. Each cell shows the classification label (colour) and the underlying H-Score (number). Blue = Negative; yellow = Low; red = Positive; dark red = High. This is the primary output of the analysis — a definitive molecular profile of each CUP sample across all 12 markers."}
+knitr::include_graphics(file.path(PLOT_DIR, "sample_classification_heatmap.png"))
+```
+

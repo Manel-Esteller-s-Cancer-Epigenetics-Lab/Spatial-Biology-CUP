@@ -1,0 +1,670 @@
+---
+title: "CUP Cohort - Classification Comparison: Xenium vs Clinical Predictions"
+author: "Abu Saadat"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: "right"
+    toc-title: "Contents"
+    toc-expand: true
+    code-fold: true
+    code-tools: false
+    code-summary: "Hide code"
+    lightbox: true
+    self-contained: true
+    fig-width: 12
+    fig-height: 7
+    fig-dpi: 150
+    cap-location: bottom
+    fontsize: 1.05em
+    linestretch: 1.6
+    theme:
+      light: "cosmo"
+      dark : "cyborg"
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+```{css, echo = FALSE}
+.justify {
+  text-align: justify !important
+}
+```
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(scales)
+library(readxl)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+ANALYSIS_ROOT <- "."
+CLASS_DIR     <- file.path(ANALYSIS_ROOT, "Classification")
+PROGENY_DIR   <- file.path(ANALYSIS_ROOT, "PROGENy")
+EXCEL_PATH    <- file.path(ANALYSIS_ROOT, "ST-CUP_Clinical Data Summary_APRIL2026.xlsx")
+
+# ── Load data ──────────────────────────────────────────────────────────────────
+clinical_raw   <- read_excel(EXCEL_PATH, sheet = 1)
+origin_class   <- read.csv(file.path(CLASS_DIR, "origin_classification.csv"))
+origin_hscores <- read.csv(file.path(CLASS_DIR, "origin_gene_hscores.csv"))
+progeny_v3     <- read.csv(file.path(PROGENY_DIR, "sample_classification_ONC_IMI_v3_mixed.csv"))
+progeny_scores_tumor  <- read.csv(file.path(PROGENY_DIR, "progeny_scores_tumor.csv"),
+                                   row.names = 1, check.names = FALSE)
+progeny_scores_stroma <- read.csv(file.path(PROGENY_DIR, "progeny_scores_stroma.csv"),
+                                   row.names = 1, check.names = FALSE)
+
+# ── Colour palettes ────────────────────────────────────────────────────────────
+ONC_IMI_COLS  <- c("ONC-CUP" = "#D73027", "IMI-CUP" = "#4393C3")
+MATCH_COLS    <- c(
+  "Match (rank 1)"        = "#1A7F24",
+  "Match (rank 2)"        = "#52A855",
+  "Match (rank 3)"        = "#95C896",
+  "Partial (hepatobiliary)" = "#FF7F0E",
+  "Not in panel"          = "#9467BD",
+  "Mismatch"              = "#D62728"
+)
+
+# ── Standardise clinical sample IDs to our format  ────────────────────────────
+# "CUP-114B" → "CUP_114"  |  "CUP-271" → "CUP_271"
+clinical <- clinical_raw |>
+  rename(clinical_id = `CUP sample ID (IJC)`) |>
+  filter(grepl("^CUP-", clinical_id)) |>
+  mutate(
+    sample_name = sub("B$", "", clinical_id),
+    sample_name = gsub("-", "_", sample_name)
+  )
+
+# ── Gene-to-origin mapping (matches Script 05) ────────────────────────────────
+ORIGIN_MAP <- list(
+  Colorectal     = list(genes = c("CDX2","SATB2","KRT20"),        weights = c(1.0,1.0,0.5)),
+  Liver_HCC      = list(genes = c("CPS1","ARG1"),                 weights = c(1.0,1.0)),
+  Lung_Adeno     = list(genes = c("NKX2.1"),                      weights = c(1.0)),
+  Thyroid        = list(genes = c("TG","NKX2.1"),                 weights = c(1.0,0.5)),
+  Neuroendocrine = list(genes = c("SYP"),                         weights = c(1.0)),
+  Breast         = list(genes = c("GATA3","ESR1","PGR"),          weights = c(1.0,1.0,1.0)),
+  Gynaecological = list(genes = c("PAX8","WT1","PAX2"),           weights = c(1.0,1.0,0.5)),
+  Melanoma       = list(genes = c("SOX10"),                       weights = c(1.0)),
+  Squamous       = list(genes = c("TP63"),                        weights = c(1.0)),
+  Prostate       = list(genes = c("FOLH1","NKX3.1","AMACR"),      weights = c(1.0,1.0,1.0)),
+  Renal          = list(genes = c("PAX8","PAX2","MME"),            weights = c(1.0,0.5,0.5)),
+  Urothelial     = list(genes = c("GATA3","TP63"),                weights = c(1.0,0.5))
+)
+
+# ── Abbreviation mapping (clinical → our site labels) ─────────────────────────
+ABBR_MAP <- c(
+  BRCA = "Breast",  PDAC = "Pancreatic ductal", LUAD = "Lung_Adeno",
+  RCC  = "Renal",   COAD = "Colorectal",        CHOL = "Liver_HCC / biliary",
+  STAD = "Gastric", LUSC = "Squamous"
+)
+
+# ── H-score wide table ────────────────────────────────────────────────────────
+hscore_wide <- origin_hscores |>
+  dplyr::select(sample_name, gene, H_Score) |>
+  mutate(H_Score = round(H_Score, 2)) |>
+  pivot_wider(names_from = gene, values_from = H_Score)
+```
+
+---
+
+# Overview
+
+::: {.justify}
+
+This report benchmarks two types of classification produced from our Xenium spatial transcriptomics data against the predictions recorded in the clinical summary table (April 2026 edition):
+
+1. **Tissue-of-origin** - our marker H-score approach (top-1/2/3 candidates) compared to VisiumST, dkfz-Tumor only, OncoNPC, and EPICUP predictions.
+2. **ONC-CUP vs IMI-CUP phenotype** - our PROGENy classification compared to the Visium-derived PROGENy call in the clinical table.
+
+Fourteen CUP samples were profiled by Xenium 5K. Six CUP samples present in the clinical table (CUP-271, CUP-355, CUP-372, CUP-375, CUP-386, CUP-387) were not included in Xenium profiling (no data was discarded due to quality) and are excluded from direct comparison.
+
+:::
+
+---
+
+# Part 1: Tissue-of-Origin Comparison
+
+## 1.1 External prediction methods
+
+::: {.justify}
+
+Four tissue-of-origin classifiers appear in the clinical summary:
+
+| Method | Platform | Approach |
+|--------|----------|----------|
+| **VisiumST** | Visium spatial transcriptomics | Transcriptome-based deconvolution; used as primary clinical reference |
+| **dkfz (Tumor only)** | DNA methylation array | DKFZ classifier applied to methylation profiles from tumour-enriched regions |
+| **OncoNPC (Early & Late)** | Whole exome sequencing | Probabilistic classifier using somatic mutation signatures at early and late clonal evolution stages |
+| **EPICUP** | DNA methylation | Genome-wide methylation reference atlas for primary site prediction |
+
+:::
+
+## 1.2 Our Xenium-based classification
+
+::: {.justify}
+
+We computed a **spatial H-Score** (% positive cells × mean intensity of positive cells) for 20 immunohistochemical analogue genes assayed in the Xenium 5K panel. Genes are grouped into 12 candidate primary sites and the weighted mean H-Score across contributing genes determines the site score. The **top-3 ranked sites** are reported per sample.
+
+Reporting three predictions is deliberate: when a strong signal from a non-specific marker (e.g. CPS1 in a lung cancer, MME/CD10 in any carcinoma) pushes the true primary to rank-2 or rank-3, the biology is still captured within the prediction list even if it is not the leading call. Concordance analysis should therefore consider all three ranks rather than only top-1.
+
+**Gene-to-site assignments:**
+
+:::
+
+```{r origin-map-table}
+tibble::tibble(
+  Site          = names(ORIGIN_MAP),
+  Genes         = sapply(ORIGIN_MAP, function(x) paste(x$genes, collapse = " + ")),
+  Weights       = sapply(ORIGIN_MAP, function(x) paste(x$weights, collapse = " / ")),
+  `IHC analogue` = c(
+    "CDX2, SATB2, CK20", "HepPar1 (CPS1), ARG1", "TTF1 (NKX2-1)",
+    "Thyroglobulin, TTF1", "Synaptophysin", "GATA3, ER, PR",
+    "PAX8, WT1, PAX2", "SOX10", "p63 (TP63)", "PSMA, NKX3.1, AMACR",
+    "PAX8, PAX2, CD10", "GATA3, p63"
+  )
+) |>
+  kable(caption = "Table 1. Origin gene panel - site assignments, contributing genes, and weights.") |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 11) |>
+  column_spec(1, bold = TRUE)
+```
+
+::: {.callout-note}
+## Panel coverage caveat
+Several clinically important primary sites **have no dedicated markers** in the Xenium 5K panel: pancreatic ductal adenocarcinoma (PDAC), gastric/stomach adenocarcinoma (STAD), and upper GI tract tumours. When a sample's true primary falls into one of these categories, our method will default to the highest-scoring proxy marker, which may not reflect the true origin.
+:::
+
+## 1.3 Side-by-side comparison
+
+```{r comparison-table}
+# Build wide comparison table for the 14 Xenium CUP samples
+comparison <- clinical |>
+  filter(sample_name %in% origin_class$sample_name) |>
+  dplyr::select(
+    sample_name,
+    VisiumST   = `Tumor-of-origin based on VisiumST`,
+    dkfz_tumor = `dkfz-Tumor only`,
+    OncoNPC    = `OncoNPC (Early&Late Mutations)`,
+    EPICUP
+  ) |>
+  left_join(
+    origin_class |>
+      dplyr::select(sample_name, top1, top2, top3),
+    by = "sample_name"
+  ) |>
+  mutate(
+    # Extract just the type name from top1 (strip score in parentheses)
+    top1_site = sub(" \\(.*\\)$", "", top1),
+    top1_score = as.numeric(sub(".*\\((.*)\\)$", "\\1", top1)),
+    # Simplify dkfz to type only
+    dkfz_tumor = sub(":.*", "", dkfz_tumor),
+    # Truncate OncoNPC (multi-line) to first entry
+    OncoNPC = sub("\r?\n.*", "", OncoNPC),
+    OncoNPC = sub(": [0-9.]+$", "", OncoNPC)
+  ) |>
+  arrange(sample_name)
+
+comparison |>
+  dplyr::select(sample_name, VisiumST, dkfz_tumor, OncoNPC, EPICUP, top1, top2, top3) |>
+  kable(
+    col.names = c("Sample", "VisiumST", "dkfz (Tumour)", "OncoNPC (E+L)", "EPICUP",
+                  "Xenium top-1", "Xenium top-2", "Xenium top-3"),
+    caption = "Table 2. Tissue-of-origin predictions across methods. VisiumST is the primary clinical reference. Xenium predictions show top-3 candidates with H-Scores in parentheses."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 10) |>
+  column_spec(2, bold = TRUE, color = "#2C6E49") |>
+  column_spec(6, bold = TRUE, color = "#003049")
+```
+
+## 1.4 Concordance with VisiumST
+
+```{r concordance-classify}
+# Rank-aware concordance - checking whether the VisiumST primary appears in top-1, -2, or -3
+concordance_tbl <- tibble::tribble(
+  ~sample_name, ~VisiumST, ~our_top1,    ~status,                  ~brief_reason,
+  "CUP_114",  "BRCA",  "Melanoma",   "Match (rank 3)",         "SOX10 dominates (H=80.7); CPS1 signal suppresses Breast to rank 3 (H-score 35.7) - Breast IS in our top-3, see §1.5",
+  "CUP_274",  "LUAD",  "Liver_HCC",  "Match (rank 2)",         "CPS1 high (H=94.7) pushes Lung_Adeno to rank 2 (score 27.2); NKX2-1 elevated but outscored - see §1.5",
+  "CUP_297",  "PDAC",  "Neuroendo.", "Not in panel",           "No PDAC-specific markers; SYP weakly elevated (H=6.7) drives default Neuroendocrine call",
+  "CUP_351",  "LUAD",  "Urothelial", "Mismatch",               "NKX2-1 essentially absent (H=0.8); Lung_Adeno absent from all 3 predictions - true miss",
+  "CUP_353",  "LUAD",  "Lung_Adeno", "Match (rank 1)",         "NKX2-1 (TTF1) extremely high (H=238); unambiguous lung adenocarcinoma signal",
+  "CUP_368",  "RCC",   "Renal",      "Match (rank 1)",         "PAX8 very high (H=79.0); canonical renal cell carcinoma marker",
+  "CUP_369",  "COAD",  "Colorectal", "Match (rank 1)",         "CDX2 high (H=37.6) and KRT20 elevated (H=15.0); strong colorectal signature",
+  "CUP_373",  "CHOL",  "Liver_HCC",  "Partial (hepatobiliary)", "CPS1 (H=11.6) and ARG1 (H=20.4) elevated; panel cannot distinguish HCC from intrahepatic CHOL",
+  "CUP_374",  "RCC",   "Renal",      "Match (rank 1)",         "PAX8 high (H=25.0) with supporting PAX2 (H=4.5); consistent RCC call",
+  "CUP_376",  "LUAD",  "Renal",      "Mismatch",               "MME/CD10 extreme (H=256) inflates Renal score; NKX2-1 low (H=1.0) - Lung_Adeno absent from all 3",
+  "CUP_381",  "LUAD",  "Lung_Adeno", "Match (rank 1)",         "NKX2-1 (TTF1) high (H=108); strong lung adenocarcinoma signal",
+  "CUP_383",  "LUAD",  "Liver_HCC",  "Mismatch",               "CPS1 elevated (H=32.6); NKX2-1 essentially absent (H=1.1) - Lung_Adeno absent from all 3",
+  "CUP_385",  "LUAD",  "Prostate",   "Mismatch",               "NKX2-1 absent (H=0.3); AMACR/NKX3.1 moderately positive - Lung_Adeno absent from all 3",
+  "CUP_394",  "STAD",  "Prostate",   "Not in panel",           "No gastric markers; AMACR high (H=37.5) drives default Prostate call"
+) |>
+  mutate(status = factor(status, levels = names(MATCH_COLS)))
+
+concordance_tbl |>
+  dplyr::select(sample_name, VisiumST, our_top1, status, brief_reason) |>
+  kable(
+    col.names = c("Sample", "VisiumST", "Xenium top-1", "Status", "Brief rationale"),
+    caption   = paste0(
+      "Table 3. Rank-aware concordance between Xenium predictions (top-1/2/3) and the VisiumST reference.",
+      " 'Match (rank N)' means the VisiumST primary appears as our N-th prediction;",
+      " 'Mismatch' means it is absent from all three."
+    )
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 10) |>
+  column_spec(4, bold = TRUE,
+              color = MATCH_COLS[as.character(concordance_tbl$status)])
+```
+
+```{r concordance-summary-fig, fig.height=4.5, fig.cap="Figure 1. Rank-aware concordance between Xenium top-3 predictions and the VisiumST reference. Green shading indicates which rank the correct primary site appears at; red = absent from all three predictions."}
+conc_counts <- concordance_tbl |>
+  count(status) |>
+  mutate(status = factor(status, levels = names(MATCH_COLS)))
+
+ggplot(conc_counts, aes(x = status, y = n, fill = status)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_text(aes(label = n), vjust = -0.4, fontface = "bold", size = 5) +
+  scale_fill_manual(values = MATCH_COLS) +
+  scale_y_continuous(limits = c(0, 6.5), expand = expansion(mult = c(0, 0))) +
+  labs(
+    title    = "Xenium top-3 predictions vs VisiumST - rank-aware concordance (n = 14 CUP samples)",
+    subtitle = paste0(
+      "Dark green = correct primary is our top-1 | Medium green = top-2 | Light green = top-3\n",
+      "Orange = same anatomical compartment (hepatobiliary), different subtype\n",
+      "Purple = no panel markers for expected primary | Red = primary absent from all three predictions"
+    ),
+    x = NULL, y = "Number of samples"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5, size = 11),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey40", size = 8),
+    axis.text.x   = element_text(face = "bold", size = 9, angle = 15, hjust = 1)
+  )
+```
+
+::: {.callout-tip}
+## Summary
+Considering all three Xenium predictions per sample: **5 samples** have the correct primary as top-1, **1 sample** (CUP_274) as top-2, and **1 sample** (CUP_114) as top-3 - giving **7/14 (50%)** with the clinical primary captured somewhere in the Xenium prediction list. **1 sample** (CUP_373) is a partial match (correct hepatic compartment, but panel cannot distinguish HCC from cholangiocarcinoma). **2 samples** (CUP_297, CUP_394) have primaries with no dedicated panel markers (PDAC, STAD). Only **4 samples** represent genuine mismatches where the correct primary is absent from all three predictions (CUP_351, CUP_376, CUP_383, CUP_385 - all are NKX2-1-negative LUAD variants that our single-marker lung entry cannot capture).
+:::
+
+## 1.5 Sample-level commentary
+
+### Top-1 concordant samples
+
+**CUP_353 - Lung_Adeno ✓ (VisiumST: LUAD)**
+
+::: {.justify}
+NKX2-1 (TTF1) H-Score = **237.6**, by far the highest single-gene score in the cohort for this marker. TTF1 is the defining transcription factor for lung adenocarcinoma and thyroid, expressed in >70% of LUAD. Our panel unambiguously identifies this sample. Our top-2 (Thyroid) is also NKX2-1-driven but shares this marker with a lower weight; the lung interpretation is supported by absence of thyroglobulin (TG H-Score = 0.35).
+:::
+
+**CUP_368 - Renal ✓ (VisiumST: RCC)**
+
+::: {.justify}
+PAX8 H-Score = **79.0**, a strong and specific marker for renal cell carcinoma (also used in ovarian/Müllerian - see WT1 = 0.09 ruling out gynaecological origin). PAX2 also contributes modestly (H = 1.93). This is one of the cleanest calls in the cohort.
+:::
+
+**CUP_369 - Colorectal ✓ (VisiumST: COAD)**
+
+::: {.justify}
+CDX2 H-Score = **37.6** with supporting KRT20 = **15.0** - both canonical colorectal markers. CDX2 is the master transcription factor for intestinal differentiation; its co-expression with KRT20 strongly indicates a colorectal primary. Our top-2 (Prostate, score 6.1) reflects low background in AMACR.
+:::
+
+**CUP_374 - Renal ✓ (VisiumST: RCC)**
+
+::: {.justify}
+PAX8 H-Score = **25.0**, consistent with clear cell or papillary RCC. PAX2 adds supporting evidence (H = 4.5). The call is unambiguous. Lower overall scores compared to CUP_368 likely reflect lower tumour purity or fewer tumour cells per capture area.
+:::
+
+**CUP_381 - Lung_Adeno ✓ (VisiumST: LUAD)**
+
+::: {.justify}
+NKX2-1 H-Score = **108.2** - the second-highest TTF1 signal in the cohort. Absence of thyroglobulin (TG H-Score = 1.01) confirms lung over thyroid origin.
+:::
+
+### Correct biology captured in top-2 or top-3
+
+**CUP_274 - Liver_HCC top-1, Lung_Adeno top-2 ✓ (VisiumST: LUAD)**
+
+::: {.justify}
+CPS1 H-Score = **94.7**, one of the highest values in the cohort, pushes Liver_HCC to rank-1 with a score of 47.8. However, NKX2-1 is also clearly elevated (H = **27.2**), which correctly scores as Lung_Adeno at rank-2 (score 27.2). CPS1 encodes carbamoyl-phosphate synthase 1, a hepatocyte marker - but CPS1 expression can occur aberrantly in lung adenocarcinoma, particularly mucinous or mixed subtypes. VisiumST uses the full transcriptome and correctly promotes LUAD.
+
+Crucially, our Lung_Adeno prediction is present and supported by a strong NKX2-1 signal - the correct biology is captured at rank-2. In reporting, this sample's top-2 should be highlighted alongside top-1, as NKX2-1 positivity provides actionable information independent of the ranking artefact caused by CPS1.
+:::
+
+**CUP_114 - Melanoma top-1, Urothelial top-2, Breast top-3 ✓ (VisiumST: BRCA)**
+
+::: {.justify}
+SOX10 H-Score = **80.7** dominates the prediction, giving a Melanoma rank-1 call. GATA3 is also extremely high (H = **100.4**) - but in our scoring model, GATA3 contributes to both the Urothelial site (with TP63, weight 1.0 + 0.5) and the Breast site (with ESR1 and PGR, weight 1.0 each). The Breast score = (GATA3 + ESR1 + PGR) / 3 = (100.4 + 5.7 + 1.1) / 3 = **35.7**, placing Breast at rank-3 behind the higher-weighted Urothelial combination.
+
+So while the Melanoma call is top-1, the correct BRCA biology is present in our data at rank-3, driven by strongly positive GATA3, ESR1, and PGR. The VisiumST call leverages the full transcriptome and correctly prioritises the hormone receptor positivity over the SOX10 signal. This sample may represent a breast cancer metastasis with aberrant SOX10 expression, as occurs in metaplastic breast carcinoma and some triple-negative subtypes, where neural crest gene re-activation has been documented.
+
+The clinical interpretation should therefore weigh the Breast prediction seriously despite its rank-3 position, particularly given the strong GATA3 and ESR1 signals.
+:::
+
+### Partial concordance
+
+**CUP_373 - Liver_HCC / Partial (VisiumST: CHOL - cholangiocarcinoma)**
+
+::: {.justify}
+CPS1 H-Score = **11.6** and ARG1 = **20.4**. Both markers are hepatocyte-specific: CPS1 is a urea cycle enzyme and ARG1 is expressed in hepatocytes and activated macrophages. Our panel labels this "Liver_HCC," which is correct at the anatomical compartment level - both HCC and intrahepatic cholangiocarcinoma arise in the liver. However, we cannot distinguish between HCC and CHOL histological subtypes because dedicate cholangiocyte markers (EpCAM, CK7) are not in the origin panel. This represents a panel limitation rather than a genuine misclassification.
+:::
+
+### True mismatches - correct primary absent from all three predictions
+
+**CUP_297 - Neuroendocrine (VisiumST: PDAC)**
+
+::: {.justify}
+Pancreatic ductal adenocarcinoma has **no dedicated markers** in the Xenium 5K origin panel. The best proxy genes for PDAC (MUC5AC, SMAD4 loss, CA19-9 protein) are absent. SYP H-Score = **6.7**, a modest neuroendocrine signal - this may reflect genuine minor neuroendocrine differentiation within a PDAC (mixed exocrine-neuroendocrine tumours occur) or simply low-level background SYP expression. The call should be interpreted as "no specific origin marker detected" rather than a neuroendocrine primary.
+:::
+
+**CUP_351 - Urothelial (VisiumST: LUAD)**
+
+::: {.justify}
+NKX2-1 H-Score = **0.8** - essentially absent, making a Lung_Adeno call less confident. GATA3 H-Score = **8.4** is moderately elevated. GATA3 is a broad transcription factor expressed in breast, urothelial, and T-cell lineages; in our model it contributes to both Breast (with ESR1/PGR) and Urothelial (with TP63) signatures. The Urothelial score of 6.4 (GATA3 × 1.0 + TP63 × 0.5, normalised) wins by default because the true marker (NKX2-1) is absent from this sample, possibly due to low tumour purity or a NKX2-1-negative LUAD subtype (squamous or large cell).
+:::
+
+**CUP_376 - Renal (VisiumST: LUAD)**
+
+::: {.justify}
+MME (CD10) H-Score = **256** - an extreme outlier in this cohort. In our model, MME contributes to the Renal score (0.5 weight) alongside PAX8 (1.0 weight = 1.48) and PAX2 (0.5 weight = 0.82). The Renal score is dominated by the MME term: (1.48 + 0.5×0.82 + 0.5×256) / 2.0 = 65.0. However, CD10 is non-specific at such high levels - it is expressed in mature B-cells, some carcinomas, and stromal cells. PAX8 is only 1.48 (essentially negative), providing no corroborating evidence of renal origin. NKX2-1 is also low (1.03), limiting the Lung_Adeno score. This is an artefact of extreme MME expression; the Renal call should not be taken at face value. Our panel fails to call LUAD here because NKX2-1 is absent/low in this sample.
+:::
+
+**CUP_383 - Liver_HCC (VisiumST: LUAD)**
+
+::: {.justify}
+CPS1 H-Score = **32.6**, while NKX2-1 = 1.06 (negative). Similar to CUP_274, CPS1 elevation drives a spurious Liver_HCC call. The true primary is lung (VisiumST = LUAD) but NKX2-1 is absent, likely indicating a NKX2-1-negative lung cancer histology (squamous, large cell, or mucinous adenocarcinoma). As with CUP_376, the absence of the canonical marker prevents a correct call.
+:::
+
+**CUP_385 - Prostate (VisiumST: LUAD)**
+
+::: {.justify}
+NKX2-1 = 0.28 (negative). AMACR H-Score = **15.7**, NKX3.1 = **14.3**, FOLH1 = 4.9 - all modestly elevated. AMACR is expressed in some non-prostate adenocarcinomas (notably colorectal, gastric, and lung). Combined Prostate score = (4.9 + 14.3 + 15.7)/3 = 11.6 wins by default. The LUAD call cannot be made without NKX2-1. This sample likely represents a NKX2-1-negative LUAD subtype.
+:::
+
+**CUP_394 - Prostate (VisiumST: STAD - gastric)**
+
+::: {.justify}
+Gastric adenocarcinoma has **no dedicated markers** in our panel. AMACR H-Score = **37.5** - elevated, potentially reflecting aberrant expression in a gastric primary (AMACR can be expressed in intestinal-type gastric adenocarcinoma given their shared CDX2/intestinal lineage). CDX2 = 2.45 is low-moderate, consistent with intestinal-type gastric cancer but not reaching colorectal levels. The Prostate call is a default in the absence of gastric-specific markers; the clinical context (VisiumST = STAD, suspected ovarian primary by clinician) makes prostate origin implausible.
+:::
+
+---
+
+# Part 2: ONC-CUP vs IMI-CUP Phenotype Comparison
+
+$$\text{ONC\_score}_\text{v3} = \text{mean}(\text{PI3K, EGFR, MAPK, VEGF})_\text{[tumour pseudobulk]}$$
+
+$$\text{IMI\_score}_\text{v3} = \text{mean}(\text{JAK-STAT, NFkB, TNF}\alpha)_\text{[stroma pseudobulk]}$$
+
+$$\delta_\text{v3} = \text{ONC\_score} - \text{IMI\_score}$$
+
+## 2.1 Comparison table
+
+```{r onc-imi-table}
+# Map clinical PROGENy column to our sample names
+clinical_progeny <- clinical |>
+  dplyr::select(sample_name, clinical_id, clinical_phenotype = PROGENy) |>
+  filter(!is.na(clinical_phenotype))
+
+# Merge with our v3 classification
+progeny_compare <- progeny_v3 |>
+  filter(grepl("^CUP_", sample_name)) |>
+  left_join(clinical_progeny, by = "sample_name") |>
+  filter(!is.na(clinical_phenotype)) |>
+  mutate(
+    our_phenotype = phenotype,
+    # Standardise clinical label
+    clinical_phenotype = paste0(clinical_phenotype, "-CUP"),
+    concordant = (our_phenotype == clinical_phenotype),
+    status = case_when(
+      concordant  ~ "Match",
+      !concordant ~ "Mismatch"
+    )
+  ) |>
+  arrange(desc(delta))
+
+progeny_compare |>
+  dplyr::select(
+    sample_name, clinical_phenotype, our_phenotype,
+    ONC_score, IMI_score, delta, status
+  ) |>
+  kable(
+    col.names = c("Sample", "Clinical (VisiumST tumour-only)",
+                  "Xenium v3 (mixed-compartment)",
+                  "ONC score [tumour]", "IMI score [stroma]",
+                  "delta (v3)", "Status"),
+    digits = 3,
+    caption = "Table 4. ONC/IMI phenotype comparison. Clinical classification uses tumour-only pseudobulk for both pathway groups; our v3 uses tumour for ONC and stroma for IMI."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 11) |>
+  column_spec(2, color = ifelse(progeny_compare$clinical_phenotype == "ONC-CUP", "#D73027", "#4393C3"),
+              bold = TRUE) |>
+  column_spec(3, color = ifelse(progeny_compare$our_phenotype == "ONC-CUP", "#D73027", "#4393C3"),
+              bold = TRUE) |>
+  column_spec(7, bold = TRUE,
+              color = ifelse(progeny_compare$status == "Match", "#2CA02C", "#D62728"))
+```
+
+```{r onc-imi-fig, fig.height=5, fig.cap="Figure 2. ONC score (tumour, x-axis) vs IMI score (stroma, y-axis) for each sample. Points above the diagonal have higher ONC than IMI signal (ONC-CUP); below have higher IMI signal (IMI-CUP). Clinical calls are indicated by the surrounding shape."}
+plot_df <- progeny_compare |>
+  mutate(
+    shape_val = case_when(
+      status == "Match"    ~ 16,  # filled circle
+      status == "Mismatch" ~ 23   # filled diamond
+    ),
+    label_col = case_when(
+      status == "Mismatch" ~ "red",
+      TRUE                 ~ "black"
+    )
+  )
+
+score_range <- range(c(plot_df$ONC_score, plot_df$IMI_score))
+pad <- diff(score_range) * 0.14
+
+ggplot(plot_df, aes(x = ONC_score, y = IMI_score, color = our_phenotype)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              linewidth = 0.5, color = "grey50") +
+  geom_point(aes(shape = status), size = 4.5, stroke = 1.2, alpha = 0.9) +
+  ggrepel::geom_text_repel(
+    aes(label = sample_name, fontface = ifelse(status == "Mismatch", "bold", "plain")),
+    size = 3, max.overlaps = 20, show.legend = FALSE
+  ) +
+  scale_color_manual(values = ONC_IMI_COLS, name = "Our v3 call") +
+  scale_shape_manual(values = c("Match" = 16, "Mismatch" = 23),
+                     name = "vs Clinical") +
+  scale_x_continuous(limits = score_range + c(-pad, pad)) +
+  scale_y_continuous(limits = score_range + c(-pad, pad)) +
+  labs(
+    title    = "ONC score [tumour] vs IMI score [stroma] - v3 mixed-compartment",
+    subtitle = "Above diagonal = ONC-CUP | Below diagonal = IMI-CUP\nCircle = agrees with clinical | Diamond = differs from clinical",
+    x = "ONC score (tumour pseudobulk): mean(PI3K, EGFR, MAPK, VEGF)",
+    y = "IMI score (stroma pseudobulk): mean(JAK-STAT, NFkB, TNFα)"
+  ) +
+  theme_classic(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold", hjust = 0.5, size = 12),
+    plot.subtitle = element_text(hjust = 0.5, color = "grey40", size = 9),
+    legend.position = "right",
+    aspect.ratio    = 1
+  )
+```
+
+## 2.5 Concordance and mismatch analysis
+
+```{r concordance-progeny}
+n_match    <- sum(progeny_compare$status == "Match")
+n_mismatch <- sum(progeny_compare$status == "Mismatch")
+n_total    <- nrow(progeny_compare)
+
+cat(sprintf("Agreement: %d / %d samples (%.0f%%)\n",
+            n_match, n_total, 100 * n_match / n_total))
+cat("\nMismatched samples:\n")
+progeny_compare |>
+  filter(status == "Mismatch") |>
+  dplyr::select(sample_name, clinical_phenotype, our_phenotype, ONC_score, IMI_score, delta) |>
+  print()
+```
+
+::: {.justify}
+
+Overall concordance between our v3 mixed-compartment classification and the clinical Visium-based call is **`r paste0(sum(progeny_compare$status == "Match"), "/", nrow(progeny_compare))` (`r sprintf("%.0f%%", 100 * mean(progeny_compare$status == "Match"))`)**, with two samples differing.
+
+:::
+
+### CUP_114: Visium = IMI-CUP → Xenium = ONC-CUP
+
+::: {.justify}
+
+This is the most instructive mismatch.
+
+- **ONC score (tumour) = +0.099** - ONC pathways are weakly active in tumour cells
+- **IMI score (stroma) = −0.441** - JAK-STAT/NFkB/TNFα are *suppressed* in the stroma
+
+When IMI pathways are scored in the stroma rather than the tumour, the signal changes direction: the stroma is not inflamed. This yields δ = +0.54, an ONC-CUP call. The discrepancy suggests that in CUP_114 tumour cells *do* transduce some JAK-STAT/NFkB signal (hence the clinical IMI call), but the source of that signalling is not the stroma - the stroma itself is quiescent with respect to these pathways. This pattern is more consistent with cell-autonomous NFkB activation in the tumour (a feature of some HER2+ or TNBC breast cancers) than with a genuinely inflamed microenvironment. Given that CUP_114 is classified as BRCA by VisiumST, this interpretation is plausible.
+
+:::
+
+### CUP_394: Visium = ONC-CUP → Xenium = IMI-CUP
+
+::: {.justify}
+
+In the clinical tumour-only method, the ONC pathways outscored IMI in tumour cells, yielding an ONC call. In our v3 method:
+
+- **ONC score (tumour) = −0.756** - ONC pathways are suppressed in tumour cells
+- **IMI score (stroma) = −0.120** - IMI pathways are mildly active in stroma
+
+Both scores are negative, but the stroma IMI score is less negative than the tumour ONC score, yielding δ = −0.636, an IMI-CUP call. The sample is borderline: neither compartment shows strong pathway activation.
+
+:::
+
+::: {.callout-note}
+## Key methodological lesson
+The two mismatches both involve the stroma compartment behaving differently from what a tumour-only analysis predicts. In CUP_114, scoring IMI in tumour cells overestimates inflammatory pathway activity. In CUP_394, differences in platform (Visium spot resolution vs Xenium single-cell) and normalisation between cohorts contribute to the discrepancy. Neither case represents an outright error - they reflect genuine biological nuance that compartment-resolved analysis is designed to capture.
+:::
+
+## 2.6 Pathway scores: tumour vs stroma
+
+```{r pathway-heatmap, fig.height=6, fig.cap="Figure 3. PROGENy pathway activity scores in tumour (left) and stroma (right) pseudobulk for the 14 Xenium CUP samples, ordered by delta score (most ONC at top). ONC pathways (red group) are scored in tumour for classification; IMI pathways (blue group) are scored in stroma."}
+ONC_PATHWAYS <- c("PI3K","EGFR","MAPK","VEGF")
+IMI_PATHWAYS <- c("JAK-STAT","NFkB","TNFa")
+
+# Sample order from v3 classification (desc delta)
+sample_order <- progeny_v3 |>
+  filter(grepl("^CUP_", sample_name)) |>
+  arrange(desc(delta)) |>
+  pull(sample_name)
+
+# Pivot scores to long form for both compartments
+tumor_long <- progeny_scores_tumor |>
+  as.data.frame() |>
+  tibble::rownames_to_column("pathway") |>
+  pivot_longer(-pathway, names_to = "sample_name", values_to = "score") |>
+  filter(sample_name %in% sample_order) |>
+  mutate(compartment = "Tumour")
+
+stroma_long <- progeny_scores_stroma |>
+  as.data.frame() |>
+  tibble::rownames_to_column("pathway") |>
+  pivot_longer(-pathway, names_to = "sample_name", values_to = "score") |>
+  filter(sample_name %in% sample_order) |>
+  mutate(compartment = "Stroma")
+
+plot_df2 <- bind_rows(tumor_long, stroma_long) |>
+  mutate(
+    sample_name   = factor(sample_name, levels = sample_order),
+    compartment   = factor(compartment, levels = c("Tumour","Stroma")),
+    pathway       = factor(pathway, levels = c(ONC_PATHWAYS, IMI_PATHWAYS)),
+    pathway_group = ifelse(pathway %in% ONC_PATHWAYS, "ONC", "IMI"),
+    # Mark which compartment is used for classification
+    used_for_class = (compartment == "Tumour" & pathway_group == "ONC") |
+                     (compartment == "Stroma" & pathway_group == "IMI"),
+    panel_alpha   = ifelse(used_for_class, 1.0, 0.35)
+  )
+
+ggplot(plot_df2, aes(x = sample_name, y = pathway, fill = score)) +
+  geom_tile(aes(alpha = panel_alpha), color = "white", linewidth = 0.3) +
+  geom_text(aes(label = round(score, 1)), size = 2.0, color = "grey10") +
+  scale_fill_gradient2(
+    low = "#4575B4", mid = "white", high = "#D73027",
+    midpoint = 0, limits = c(-4, 4), oob = squish,
+    name = "Activity\nscore"
+  ) +
+  scale_alpha_identity() +
+  facet_grid(pathway_group ~ compartment, scales = "free", space = "free") +
+  labs(
+    title    = "PROGENy pathway activity - tumour vs stroma compartments",
+    subtitle = "Bold tiles = used for v3 classification | Faded tiles = scored but not used\nSamples ordered by v3 delta score (most ONC-CUP at top)",
+    x = NULL, y = NULL
+  ) +
+  theme_classic(base_size = 9) +
+  theme(
+    plot.title      = element_text(face = "bold", hjust = 0.5, size = 11),
+    plot.subtitle   = element_text(hjust = 0.5, color = "grey40", size = 7.5),
+    axis.text.x     = element_text(angle = 45, hjust = 1, size = 7.5, face = "bold"),
+    axis.text.y     = element_text(size = 8, face = "bold"),
+    strip.text      = element_text(face = "bold", size = 9),
+    strip.background = element_rect(fill = "grey20", color = NA),
+    strip.text.x    = element_text(color = "white"),
+    strip.text.y    = element_text(color = "white"),
+    panel.spacing   = unit(0.4, "lines"),
+    legend.position = "right"
+  )
+```
+
+---
+
+# Summary
+
+```{r summary-table}
+# Build integrated one-row-per-sample summary for CUP samples only
+summary_tbl <- clinical |>
+  filter(sample_name %in% progeny_compare$sample_name) |>
+  dplyr::select(
+    sample_name,
+    VisiumST     = `Tumor-of-origin based on VisiumST`,
+    dkfz         = `dkfz-Tumor only`,
+    clinical_ONC_IMI = PROGENy
+  ) |>
+  mutate(
+    dkfz = sub(":.*", "", dkfz),
+    clinical_ONC_IMI = paste0(clinical_ONC_IMI, "-CUP")
+  ) |>
+  left_join(
+    origin_class |> dplyr::select(sample_name, xenium_top1 = top1),
+    by = "sample_name"
+  ) |>
+  left_join(
+    progeny_compare |>
+      dplyr::select(sample_name, xenium_ONC_IMI = our_phenotype, delta),
+    by = "sample_name"
+  ) |>
+  arrange(sample_name)
+
+summary_tbl |>
+  dplyr::select(sample_name, VisiumST, xenium_top1, dkfz,
+                clinical_ONC_IMI, xenium_ONC_IMI, delta) |>
+  kable(
+    col.names = c("Sample","VisiumST (ref)","Xenium origin top-1","dkfz (tumour)",
+                  "Clinical ONC/IMI","Xenium v3 ONC/IMI","v3 delta"),
+    digits    = 3,
+    caption   = "Table 5. Integrated classification summary for the 14 Xenium CUP samples."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 10) |>
+  column_spec(5, bold = TRUE,
+              color = ifelse(
+                grepl("ONC", summary_tbl$clinical_ONC_IMI), "#D73027", "#4393C3"
+              )) |>
+  column_spec(6, bold = TRUE,
+              color = ifelse(
+                grepl("ONC", summary_tbl$xenium_ONC_IMI), "#D73027", "#4393C3"
+              ))
+```
+

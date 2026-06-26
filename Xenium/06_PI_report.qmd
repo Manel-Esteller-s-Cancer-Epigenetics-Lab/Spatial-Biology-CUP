@@ -1,0 +1,528 @@
+---
+title: "CUP Cohort - Classification (19 Samples)"
+author: "Abu Saadat"
+date: "`r Sys.Date()`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    toc-location: "right"
+    toc-title: "Contents"
+    toc-expand: true
+    code-fold: true
+    code-tools: false
+    code-summary: "Hide code"
+    lightbox: true
+    self-contained: true
+    fig-width: 12
+    fig-height: 7
+    fig-dpi: 150
+    cap-location: bottom
+    fontsize: 1.05em
+    linestretch: 1.6
+    theme:
+      light: "cosmo"
+      dark : "cyborg"
+execute:
+  warning: false
+  message: false
+  echo: false
+---
+
+```{css, echo = FALSE}
+.justify {
+  text-align: justify !important
+}
+```
+
+```{r setup}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(scales)
+
+# ── Paths ──────────────────────────────────────────────────────────────────────
+ANALYSIS_ROOT <- "."
+CLASS_DIR     <- file.path(ANALYSIS_ROOT, "Classification")
+PLOT_DIR      <- file.path(ANALYSIS_ROOT, "PLOTs", "05_origin_immune")
+COHORT_PLOTS  <- file.path(ANALYSIS_ROOT, "Cohort_Plots")
+
+# ── Load all result tables ─────────────────────────────────────────────────────
+thresholds      <- read.csv(file.path(CLASS_DIR, "threshold_table.csv"))
+hscores         <- read.csv(file.path(CLASS_DIR, "hscores_per_sample.csv"))
+classification  <- read.csv(file.path(CLASS_DIR, "sample_classification.csv"))
+origin_scores   <- read.csv(file.path(CLASS_DIR, "origin_scores.csv"))
+origin_class    <- read.csv(file.path(CLASS_DIR, "origin_classification.csv"))
+immune_scores   <- read.csv(file.path(CLASS_DIR, "immune_signature_scores.csv"))
+composite       <- read.csv(file.path(CLASS_DIR, "immune_composite_score.csv"))
+combined_class  <- read.csv(file.path(CLASS_DIR, "combined_classification_37markers.csv"))
+combined_hscores <- read.csv(file.path(CLASS_DIR, "combined_hscores_37markers.csv"))
+new_hscores     <- read.csv(file.path(CLASS_DIR, "new_markers_hscores.csv"))
+
+# ── Gene display names ─────────────────────────────────────────────────────────
+GENE_DISPLAY <- c(
+  NKX2.1 = "TTF1 (NKX2.1)", NKX3.1 = "NKX3.1",
+  CPS1   = "HepPar1 (CPS1)", FOLH1  = "PSMA (FOLH1)",
+  MME    = "CD10 (MME)",     KRT20  = "CK20 (KRT20)",
+  ERBB2  = "HER2 (ERBB2)",   CD274  = "PD-L1 (CD274)",
+  PDCD1  = "PD-1 (PDCD1)",   TNFSF10 = "TRAIL (TNFSF10)",
+  SYP    = "Synaptophysin (SYP)", TG = "Thyroglobulin (TG)"
+)
+label_gene <- function(g) ifelse(g %in% names(GENE_DISPLAY), GENE_DISPLAY[g], g)
+
+CLASS_COLS <- c(
+  "Negative" = "#2166AC", "Low"  = "#F4A924",
+  "Positive" = "#D73027", "High" = "#7F0000"
+)
+```
+
+---
+
+# Methods: How We Classified Each Sample
+
+
+::: {.justify}
+
+* **All marker analyses follow a unified three-phase framework:**
+
+  + Step 1  →  Define what "positive" means at the CELL level (t_cell threshold)
+  + Step 2  →  Compute a Spatial H-Score for each SAMPLE (quantitative ranking)
+  + Step 3  →  Classify each SAMPLE as Negative / Low / Positive / High (K-means)
+
+This framework was applied identically to all 37 markers, with only the method for computing $t_{cell}$ varying by marker type (see below).
+
+:::
+
+## Step 1: Cell-level positivity threshold ($t_{cell}$)
+
+### What is $t_{cell}$?
+
+::: {.justify}
+In a Xenium experiment, not every detected transcript signal is a genuine mRNA molecule, some arise from optical noise, non-specific probe binding, or decoding errors in the fluorescence-based spatial barcoding. The threshold $t_{cell}$ is the minimum expression level a cell must exceed to be called **positive** for a given marker. Below this level, expression is indistinguishable from technical background.
+
+We used three complementary methods to set $t_{cell}$, choosing the most conservative (highest) value:
+:::
+
+
+### Method A: Negative Control Probes
+::: {.justify}
+The Xenium 5K panel includes **40 Negative Control Probes**, these are synthetic sequences with no match anywhere in the human genome, included specifically to measure technical noise. Any signal they detect is pure background.
+
+We extracted NegControl probe counts from all 15 samples (4,149,515 cells) and computed the **mean + 2 standard deviations** of the per-probe count distribution. The result was **0.003 counts per probe**. This confirmed the experiments were technically excellent.
+:::
+
+::: {.callout-tip}
+## What this means in plain terms
+Any cell expressing a marker at a level exceeding 0.003 normalised counts has signal that is statistically above the noise floor of the experiment. For our data, this is nearly equivalent to "any detected transcript is real."
+:::
+
+### Method B: Stromal Floor (epithelial markers)
+
+::: {.justify}
+For markers that should be expressed exclusively in epithelial tumour cells like KRT20, MET, ERBB2, KIT, FGFR2, CCNE1 and MYC, we used the **stromal compartment as a biological negative control**. Stromal cells (fibroblasts, endothelial cells) should not express epithelial markers. The 95th percentile of stromal expression defines a biologically-anchored noise floor.
+
+In our cohort, this was 0 for all epithelial markers showing that these markers are essentially absent from stroma, confirming tumour specificity.
+:::
+### Method C: Gaussian Mixture Model (ICI and immune signature markers)
+
+::: {.justify}
+For immune checkpoint genes, the stromal floor is not a valid negative control; however, each marker requires a compartment-specific approach:
+
+- **PD-L1 (CD274)** shows dual expression in both tumour cells and stromal immune cells. We apply a **Combined Positive Score (CPS)**, pooling positive cells from both compartments with the total tumour cell count as the denominator — matching the clinical CPS definition used in PD-L1 IHC reporting. The GMM threshold is fitted on pooled tumour + stromal cells.
+- **LAG3, CTLA4, TIGIT, PD-1 (PDCD1)** are T-cell exhaustion markers expressed by immune cells in the stromal compartment. These are scored in stromal cells only, with the GMM fitted on stromal cells.
+
+In all cases, a **two-component GMM** separates:
+
+- **Component 1 (low):** cells with basal/leaky transcription (a few transcripts)
+- **Component 2 (high):** cells with genuine pathway activation (many transcripts)
+
+The threshold is set at the intersection of the two components — the expression level at which a cell is equally likely to belong to either population. This approach is data-driven and requires no arbitrary cutoff.
+:::
+
+
+```{r threshold-table}
+thresholds |>
+  mutate(
+    gene    = sapply(gene, label_gene),
+    t_cell  = round(t_cell, 4),
+    negctrl_threshold = round(negctrl_threshold, 4),
+    stromal_floor     = ifelse(is.na(stromal_floor), "-",
+                               round(stromal_floor, 4)),
+    gmm_threshold     = ifelse(is.na(gmm_threshold), "-",
+                               round(gmm_threshold, 4))
+  ) |>
+  dplyr::select(gene, method_secondary, negctrl_threshold,
+                stromal_floor, gmm_threshold, t_cell) |>
+  kable(
+    col.names = c("Gene", "Validation method", "NegControl",
+                  "Stromal floor", "GMM", "Final t_cell"),
+    caption = "Table 1. Cell-level positivity thresholds per gene. Final t_cell = max(NegControl, validation method)."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 11) |>
+  column_spec(6, bold = TRUE, color = "#B22222")
+```
+
+---
+
+## Step 2: The Spatial H-Score
+
+### From pathology to single-cell resolution
+::: {.justify}
+The H-score was originally developed by McCarty et al. (1986) for immunohistochemistry, where pathologists manually classify cells into four intensity categories and compute:
+
+$$H\text{-Score}_{IHC} = 1 \times (\% \text{ weak}) + 2 \times (\% \text{ moderate}) + 3 \times (\% \text{ strong}) \quad \text{[range: 0–300]}$$
+
+We adapted this into a **Spatial H-Score** that uses the quantitative resolution of single-cell transcriptomics:
+
+:::
+
+$$\boxed{\text{Spatial H-Score} = \underbrace{(\% \text{ cells} > t_{cell})}_{\text{Penetrance}} \times \underbrace{\overline{\text{expression}}_{\text{positive cells only}}}_{\text{Intensity}}}$$
+
+*Compartment per gene: tumour cells for epithelial markers; CPS (tumour + stroma positives / tumour cell denominator) for PD-L1 (CD274); stromal cells for LAG3, CTLA4, TIGIT, PD-1 (PDCD1).*
+
+**Why both components matter:**
+
+| Scenario | % positive | Mean intensity | H-Score | Interpretation |
+|---|---|---|---|---|
+| Broad, low | 80% | 1.0 | 80 | Many cells, weak signal |
+| Focal, high | 20% | 4.0 | 80 | Few cells, strong signal |
+| Broad, high | 80% | 4.0 | 320 | Genuine amplification |
+
+The H-Score correctly identifies the third scenario as most clinically relevant, something neither percentage nor intensity alone can do.
+
+::: {.callout-note}
+## Key design choice
+Mean intensity is computed **only over positive cells** (expression > $t_{cell}$), not all cells. This prevents the score from being diluted by the zero-inflated majority of non-expressing cells, this servers as a critical distinction for sparse spatial transcriptomics data.
+:::
+
+---
+
+## Srep 3: Sample Classification via K-means
+
+### Why not a fixed threshold?
+
+::: {.justify}
+Setting a fixed H-Score cutoff (e.g. "call positive if H-Score > 50") is arbitrary and cohort-specific. Instead, we ask: **does the data itself reveal natural groupings?**
+
+**K-means clustering** in one dimension finds the $k$ natural breakpoints in the H-Score distribution across 15 samples for each gene. The optimal $k$ (2 or 3) is chosen automatically by the **gap statistic**, a method that compares the within-cluster variance of your real data against what would be expected from a random uniform distribution. When $k = 2$ explains substantially more structure than $k = 1$, we use two groups (Negative / Positive). When $k = 3$ is better, we use three groups (Negative / Low / High).
+:::
+
+```{r k-table}
+classification |>
+  dplyr::select(gene, k_used) |>
+  distinct() |>
+  mutate(
+    gene   = sapply(gene, label_gene),
+    k_used = as.integer(k_used),
+    labels = case_when(
+      k_used == 2 ~ "Negative / Positive",
+      k_used == 3 ~ "Negative / Low / High",
+      TRUE        ~ as.character(k_used)
+    )
+  ) |>
+  kable(
+    col.names = c("Gene", "Optimal k", "Classification labels"),
+    caption = "Table 2. Optimal number of clusters per gene chosen by gap statistic."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 11)
+```
+
+---
+
+## Tissue of Origin Scoring
+
+### The weighted origin score
+
+::: {.justify}
+
+For the histological origin markers, we computed a **weighted origin score** for each candidate primary site per sample:
+
+:::
+
+$$\text{Origin Score}_{sample, site} = \frac{\displaystyle\sum_{i=1}^{n} w_i \cdot H\text{-Score}_{i}}{\displaystyle\sum_{i=1}^{n} w_i}$$
+
+::: {.justify}
+Where $w_i = 1.0$ for primary site-specific markers and $w_i = 0.5$ for markers shared between two sites (e.g. PAX8 shared between Gynaecological and Renal). This normalised weighted average makes scores comparable across sites with different numbers of markers.
+:::
+::: {.callout-warning}
+## Important caveat
+This scoring framework is **hypothesis-generating**, not a validated classifier. The marker-to-site associations are grounded in established diagnostic pathology literature (see References), but the weighted aggregation formula has not been trained or validated on an independent CUP cohort. Results should be interpreted alongside clinical and radiological findings, and corroborated with IHC where possible.
+:::
+
+---
+
+# Results: Actionable Targets
+
+## Classification heatmap: Molecular markers
+
+```{r mol-heatmap, fig.cap="**Figure 1.** Classification heatmap for 18 molecular markers across 19 samples. Colour = K-means classification. H-Score shown in each cell. Faceted by biological group."}
+knitr::include_graphics(
+  file.path(PLOT_DIR, "classification_heatmap_molecular_markers.png")
+)
+```
+
+## Actionable target findings
+
+```{r actionable-table}
+# Build summary from classification
+action_genes <- c("MET","ERBB2","KIT","FGFR2","CCNE1","MYC","KRT20")
+
+action_summary <- classification |>
+  filter(gene %in% action_genes) |>
+  dplyr::select(sample_name, gene, H_Score, classification) |>
+  mutate(
+    gene       = sapply(gene, label_gene),
+    H_Score    = round(H_Score, 1),
+    classification = as.character(classification)
+  ) |>
+  pivot_wider(names_from = gene, values_from = c(H_Score, classification),
+              names_glue = "{gene}_{.value}") |>
+  arrange(sample_name)
+
+# Simpler: just show classification wide table
+class_action <- classification |>
+  filter(gene %in% action_genes) |>
+  mutate(
+    gene           = factor(sapply(gene, label_gene)),
+    classification = as.character(classification),
+    H_Score        = round(H_Score, 1)
+  ) |>
+  dplyr::select(sample_name, gene, classification) |>
+  pivot_wider(names_from = gene, values_from = classification)
+
+class_action |>
+  kable(
+    caption = "Table 3. Actionable target classification per sample. Blue = Negative, Red = Positive, Dark Red = High."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 11) |>
+  column_spec(1, bold = TRUE) |>
+  scroll_box(width = "100%")
+```
+
+::: {.callout-important}
+## CUP_383: Exceptional molecular profile
+CUP_383 is simultaneously **MET Positive** (H=373), **CCNE1 High** (H=222), and **MYC Positive** (H=158). This co-occurrence of MET amplification, cyclin E overexpression, and MYC activation is a recognised molecular signature of aggressive gastric/gastro-oesophageal junction adenocarcinoma. This sample should be prioritised for primary site workup and MET inhibitor eligibility assessment.
+:::
+
+# Results: Immune Checkpoints
+
+## ICI classification
+
+```{r ici-table}
+ici_genes <- c("CD274","LAG3","CTLA4","TIGIT","PDCD1")
+
+class_ici <- classification |>
+  filter(gene %in% ici_genes) |>
+  mutate(
+    gene           = sapply(gene, label_gene),
+    classification = as.character(classification),
+    H_Score        = round(H_Score, 1)
+  )
+
+# Show H-Score table
+class_ici |>
+  dplyr::select(sample_name, gene, H_Score) |>
+  pivot_wider(names_from = gene, values_from = H_Score) |>
+  arrange(sample_name) |>
+  kable(
+    caption = "Table 4. ICI Spatial H-Score per sample (GMM-calibrated threshold; tumour cells only). Note: ICI thresholds (2.8–3.6) are more stringent than actionable target thresholds."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 11) |>
+  column_spec(1, bold = TRUE)
+```
+
+::: {.callout-important}
+## CUP_351: The immune-inflamed CUP
+CUP_351 is simultaneously positive for **PD-L1, LAG3, CTLA4, and TIGIT** making it the most ICI-active sample in the cohort. Despite being diagnostically ambiguous by origin markers (low scores across all sites), this sample has the highest probability of benefiting from immunotherapy. Multi-checkpoint positivity suggests combination ICI approaches (anti-PD1 + anti-LAG3 or anti-CTLA4) should be explored.
+:::
+
+---
+
+# Results: Immune Activity Signatures
+
+## Effector Cell Traffic (CXCL9, CXCL10, CXCL11, CXCR3)
+
+::: {.justify}
+These chemokines attract cytotoxic T cells into the tumour microenvironment. High stromal expression indicates an active T-cell recruitment programme.
+:::
+
+```{r traffic-heatmap, fig.cap="**Figure 3.** Effector Cell Traffic signature - H-Score in tumour and stroma separately. High stromal CXCL9/10/11 indicates active T-cell attraction."}
+knitr::include_graphics(
+  file.path(PLOT_DIR, "immune_traffic_heatmap.png")
+)
+```
+
+## Antitumour Cytokines (TRAIL/TNFSF10, TNF)
+
+::: {.justify}
+TRAIL and TNF are produced by tumour cells as part of autocrine apoptotic signalling or paracrine immune activation. High tumour-cell expression may reflect intrinsic apoptotic priming.
+:::
+
+```{r cytokine-heatmap, fig.cap="**Figure 4.** Antitumour cytokine signature - H-Score in tumour and stroma. Note: TNF/TNFSF10 are broadly expressed across the cohort, potentially reflecting autocrine tumour-intrinsic signalling."}
+knitr::include_graphics(
+  file.path(PLOT_DIR, "immune_cytokine_heatmap.png")
+)
+```
+
+## Composite Immune Activity Score
+
+::: {.justify}
+The composite score combines all three immune signatures viz. Effector Cell Traffic, Antitumour Cytokines, and Immune Checkpoints then normalise it between 0–1 and average it equally:
+:::
+
+$$\text{Immune Activity Score} = \frac{\text{Traffic}_{norm} + \text{Cytokine}_{norm} + \text{ICI}_{norm}}{3}$$
+
+```{r composite-plot, fig.cap="**Figure 5.** Composite Immune Activity Score. Stacked bars show contribution of each component. Diamond = composite score. CUP_351 is overwhelmingly the most immune-active sample (score 0.891)."}
+knitr::include_graphics(
+  file.path(PLOT_DIR, "immune_composite_score.png")
+)
+```
+
+```{r composite-table}
+composite |>
+  dplyr::select(sample_name, traffic_score, cytokine_score,
+                ici_score, immune_activity_score) |>
+  mutate(across(where(is.numeric), ~ round(.x, 3))) |>
+  arrange(desc(immune_activity_score)) |>
+  kable(
+    col.names = c("Sample", "Traffic score", "Cytokine score",
+                  "ICI score", "Composite score"),
+    caption = "Table 5. Composite Immune Activity Score per sample. Ranked by composite score."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE, font_size = 11) |>
+  column_spec(1, bold = TRUE) |>
+  column_spec(5, bold = TRUE,
+              color = ifelse(
+                sort(composite$immune_activity_score,
+                     decreasing = TRUE) > 0.4,
+                "#B22222", "black"))
+```
+
+# Classification: Histological markers
+
+```{r hist-heatmap, fig.cap="**Figure 6.** Classification heatmap for 19 histological origin markers. Columns ordered left-to-right by candidate primary site. Read each row to identify the molecular origin signature of each sample."}
+knitr::include_graphics(
+  file.path(PLOT_DIR, "classification_heatmap_histological_markers.png")
+)
+```
+
+## Origin score heatmap
+
+```{r origin-heatmap, fig.cap="**Figure 7.** Weighted origin score heatmap. Colour normalised within each site column. Raw score shown in each cell. Higher scores indicate stronger molecular evidence for that primary site."}
+knitr::include_graphics(
+  file.path(PLOT_DIR, "origin_score_heatmap.png")
+)
+```
+
+## Top candidate primary sites
+
+```{r origin-table}
+origin_class |>
+  kable(
+    col.names = c("Sample", "Top candidate", "2nd candidate", "3rd candidate"),
+    caption = "Table 6. Top 3 candidate primary sites per sample based on weighted spatial H-Score aggregation. Format: Site (score). Higher scores = stronger molecular evidence."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 12) |>
+  column_spec(1, bold = TRUE) |>
+  column_spec(2, bold = TRUE, color = "#B22222")
+```
+
+```{r origin-bar, fig.cap="**Figure 8.** Top 3 candidate primary sites per sample. Bar height = weighted origin score. Opacity encodes rank (solid = 1st, semi = 2nd, faint = 3rd)."}
+knitr::include_graphics(
+  file.path(PLOT_DIR, "origin_top_candidate.png")
+)
+```
+
+# Analysis Summary
+
+```{r integrated-summary}
+# Build one-row-per-sample integrated table
+int_summary <- origin_class |>
+  dplyr::select(sample_name, top_origin = top1) |>
+  mutate(top_origin = gsub(" \\(.*\\)", "", top_origin)) |>
+  left_join(
+    composite |>
+      dplyr::select(sample_name, immune_activity_score) |>
+      mutate(
+        immune_activity_score = round(immune_activity_score, 3),
+        immune_phenotype = case_when(
+          immune_activity_score >= 0.5 ~ "Hot",
+          immune_activity_score >= 0.2 ~ "Intermediate",
+          TRUE                         ~ "Cold"
+        )
+      ),
+    by = "sample_name"
+  ) |>
+  left_join(
+    classification |>
+      filter(gene == "ERBB2") |>
+      dplyr::select(sample_name, ERBB2 = classification),
+    by = "sample_name"
+  ) |>
+  left_join(
+    classification |>
+      filter(gene == "MET") |>
+      dplyr::select(sample_name, MET = classification),
+    by = "sample_name"
+  ) |>
+  left_join(
+    classification |>
+      filter(gene == "CD274") |>
+      dplyr::select(sample_name, PDL1 = classification),
+    by = "sample_name"
+  ) |>
+  mutate(
+    across(c(ERBB2, MET, PDL1), as.character),
+    actionable_flag = case_when(
+      MET %in% c("Positive","High")   ~ "MET+",
+      ERBB2 %in% c("Positive","High") ~ "ERBB2+",
+      TRUE                             ~ "-"
+    )
+  ) |>
+  arrange(sample_name)
+
+int_summary |>
+  dplyr::select(sample_name, top_origin, immune_phenotype,
+                immune_activity_score, actionable_flag, MET, ERBB2, PDL1) |>
+  kable(
+    col.names = c("Sample","Top origin","Immune phenotype",
+                  "Immune score","Priority target","MET","HER2","PD-L1"),
+    caption = "Table 8. Integrated per-sample summary: origin, immune phenotype, and key actionable targets."
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = TRUE, font_size = 11) |>
+  column_spec(1, bold = TRUE) |>
+  column_spec(3,
+    color = case_when(
+      int_summary$immune_phenotype == "Hot"          ~ "#B22222",
+      int_summary$immune_phenotype == "Intermediate" ~ "#E67E00",
+      TRUE                                           ~ "#2166AC"
+    )
+  )
+```
+
+---
+
+# Genes Absent from Panel
+
+::: {.callout-note}
+## Genes requested but absent from the Xenium 5K panel
+
+The following 4 genes were requested but confirmed absent from the panel after comprehensive alias checking across HGNC, UniProt, and literature synonyms:
+
+| Gene (IHC name) | Gene symbol |
+|---|---|
+| CCL4 (MIP-1β) | CCL4 | 
+| CCL5 (RANTES) | CCL5 | 
+| NAPSIN A | NAPSA | 
+| CK9 | KRT7 | 
+
+:::
